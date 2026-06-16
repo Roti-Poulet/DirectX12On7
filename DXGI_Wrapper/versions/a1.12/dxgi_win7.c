@@ -1,0 +1,2853 @@
+/*
+ * dxgi_win7.c — Port de dxgi.dll (Windows 10) pour Windows 7 x64
+ *
+ * Compilé avec MinGW64 : x86_64-w64-mingw32-gcc -m64 -shared ...
+ * Source unique + dxgi_win7.def
+ *
+ * Stratégie :
+ *   - DllMain charge dxgi_real.dll (=le vrai dxgi.dll Win7 renommé)
+ *     et tous les pointeurs D3DKMT de gdi32.dll, plus les APIs WNF de
+ *     ntdll (NULL sur Win7, présentes sur Win8+).
+ *   - Les 19 exports reproduisent exactement le comportement Win10 :
+ *       * CreateDXGIFactory/1/2 : retourne un wrapper COM complet qui
+ *         expose Factory1..7, délègue à dxgi_real.dll pour le vrai travail,
+ *         et stub les méthodes Win8+ absentes.
+ *       * CompatString/CompatValue : lecture registre D3DBehaviors.
+ *       * DXGIDumpJournal : ring buffer 64 entrées de 0x78 octets.
+ *       * PIX* / D3D10* : reproduits à l'identique (returnent 0 / E_NOTIMPL).
+ *       * SetAppCompatStringPointer : stocke deux pointeurs opaques.
+ *       * UpdateHMDEmulationStatus : parcourt la liste des swapchains actifs.
+ *       * ApplyCompatResolutionQuirking : InitOnce + EnumDisplaySettingsW.
+ *       * DXGIDeclareAdapterRemovalSupport : D3DKMTSetProcessDeviceRemovalSupport.
+ *       * DXGIGetDebugInterface1 : charge DXGIDebug.dll dynamiquement.
+ *       * DXGIReportAdapterConfiguration : SetupDi + D3DKMT.
+ *   - Logging : chaque entrée/sortie de fonction publique est tracée via
+ *     OutputDebugStringA (visible dans DebugView ou WinDbg).
+ *     Format : "[dxgi_win7] NomFonction(args) → HRESULT"
+ *
+ * GUIDs DXGI couverts (IID_IDXGIFactory..7, Adapter..4, Output..6,
+ * SwapChain..4, Device..4, Surface..2, Resource..1, etc.)
+ *
+ * Installation :
+ *   1. Renommer C:\Windows\System32\dxgi.dll → dxgi_real.dll
+ *   2. Copier ce build → C:\Windows\System32\dxgi.dll
+ */
+
+/* =========================================================
+ * Includes / types de base
+ * ========================================================= */
+#define INITGUID
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#define _WIN32_WINNT 0x0601   /* Windows 7 */
+#define WINVER       0x0601
+#include <windows.h>
+#include <unknwn.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
+
+#include <winternl.h>   /* fournit NTSTATUS, PVOID, ULONG, PULONG */
+#include <dxgi1_2.h>     /* fournit DXGI_ADAPTER_DESC, DXGI_ADAPTER_DESC1, et déjà les DXGI_ERROR_* */
+
+typedef unsigned char      undefined;
+typedef unsigned char      undefined1;
+typedef unsigned short     undefined2;
+typedef unsigned int       undefined4;
+typedef unsigned long long undefined8;
+typedef unsigned char      uchar;
+typedef unsigned short     ushort;
+typedef unsigned int       uint;
+typedef unsigned long long ulonglong;
+typedef long long          longlong;
+
+/* =========================================================
+ * Logging
+ * ========================================================= */
+#define LOG_BUF 512
+
+static void DXGILog(const char *fmt, ...)
+{
+    char buf[LOG_BUF];
+    va_list va;
+    va_start(va, fmt);
+    _vsnprintf(buf, LOG_BUF - 1, fmt, va);
+    buf[LOG_BUF - 1] = '\0';
+    va_end(va);
+    OutputDebugStringA(buf);
+}
+
+/* Macros pratiques */
+#define LOG(...)         DXGILog("[dxgi_win7] " __VA_ARGS__)
+#define LOG_ENTER(fn)    DXGILog("[dxgi_win7] --> " fn)
+#define LOG_LEAVE(fn,hr) DXGILog("[dxgi_win7] <-- " fn " = 0x%08X", (unsigned)(hr))
+#define LOG_VOID(fn)     DXGILog("[dxgi_win7] <-- " fn " (void)")
+
+/* =========================================================
+ * HRESULT / erreurs DXGI
+ * ========================================================= */
+#ifndef S_OK
+#define S_OK ((HRESULT)0)
+#endif
+#ifndef E_INVALIDARG
+#define E_INVALIDARG ((HRESULT)0x80070057L)
+#endif
+#ifndef E_OUTOFMEMORY
+#define E_OUTOFMEMORY ((HRESULT)0x8007000EL)
+#endif
+#ifndef E_NOTIMPL
+#define E_NOTIMPL ((HRESULT)0x80004001L)
+#endif
+#ifndef E_NOINTERFACE
+#define E_NOINTERFACE ((HRESULT)0x80004002L)
+#endif
+#ifndef E_FAIL
+#define E_FAIL ((HRESULT)0x80004005L)
+#endif
+
+#define DXGI_CREATE_FACTORY_DEBUG  0x1u
+
+/*
+ * NtStatus → HRESULT (FUN_180003614 décompilé de la dxgi Win10)
+ * Reproduit à l'identique la table de conversion.
+ */
+static HRESULT NtStatusToDxgiHR(NTSTATUS st)
+{
+    switch ((ULONG)st) {
+    case 0:           return S_OK;
+    case 0xc0000022:  return 0x80070005L; /* ACCESS_DENIED */
+    case 0xc0000001:  return 0x80004005L; /* UNSUCCESSFUL */
+    case 0x803e0006:  return 0x88980800L; /* GDI_HANDLE_ERROR */
+    case 0xc0000002:  return E_NOTIMPL;
+    case 0xc0000008:  return 0x80070006L; /* INVALID_HANDLE */
+    case 0xc000000d:  return E_INVALIDARG;
+    case 0xc0000017:  return E_OUTOFMEMORY;
+    case 0xc0000024:  return 0x80070006L;
+    case 0xc00000bb:  return E_INVALIDARG;
+    case 0xc0000510:  return DXGI_ERROR_ALREADY_EXISTS;
+    default:
+        if ((LONG)st < 0) return (HRESULT)(st | 0x10000000L);
+        return S_OK;
+    }
+}
+
+/* =========================================================
+ * GUIDs DXGI (publics SDK Microsoft, définis ici pour éviter
+ * de dépendre de dxgi.h / initguid.h)
+ * ========================================================= */
+#define MAKE_GUID(name,l,w1,w2,b1,b2,b3,b4,b5,b6,b7,b8) \
+    static const GUID name = {l,w1,w2,{b1,b2,b3,b4,b5,b6,b7,b8}}
+
+MAKE_GUID(IID_IUnknown_,         0x00000000,0x0000,0x0000,0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46);
+
+MAKE_GUID(IID_IDXGIDeviceSubObj, 0x3D3E0379,0xF9DE,0x4D58,0xBB,0x6C,0x18,0xD6,0x29,0x92,0xF1,0xA6);
+
+
+
+MAKE_GUID(IID_IDXGIAdapter3,     0x645967A4,0x1392,0x4310,0xA7,0x98,0x80,0x53,0xCE,0x3E,0x93,0xFD);
+MAKE_GUID(IID_IDXGIAdapter4,     0x3C8D99D1,0x4FBF,0x4181,0xA8,0x2C,0xAF,0x66,0xBF,0x7B,0xD2,0x4E);
+
+MAKE_GUID(IID_IDXGIOutput2,      0x595E39D1,0x2724,0x4663,0x99,0xB1,0xDA,0x96,0x9D,0xE2,0x83,0x64);
+MAKE_GUID(IID_IDXGIOutput3,      0x8A6BB301,0x7E7E,0x41F4,0xA8,0xE0,0x5B,0x32,0xF7,0xF9,0x9B,0x18);
+MAKE_GUID(IID_IDXGIOutput4,      0xDC7DCA35,0x2196,0x414D,0x9F,0x53,0x61,0x78,0x84,0x03,0x2A,0x60);
+MAKE_GUID(IID_IDXGIOutput5,      0x80A07424,0xAB52,0x42EB,0x83,0x3C,0x0C,0x42,0xFD,0x28,0x2D,0x98);
+MAKE_GUID(IID_IDXGIOutput6,      0x068346E8,0xAAEC,0x4B84,0xAD,0xD7,0x13,0x7F,0x51,0x3F,0x77,0xA1);
+
+MAKE_GUID(IID_IDXGISwapChain2,   0xA8BE2AC4,0x199F,0x4946,0xB3,0x31,0x79,0x59,0x9F,0xB9,0x8D,0xE7);
+MAKE_GUID(IID_IDXGISwapChain3,   0x94D99BDB,0xF1F8,0x4AB0,0xB2,0x36,0x7D,0xA0,0x17,0x0E,0xDA,0xB1);
+MAKE_GUID(IID_IDXGISwapChain4,   0x3D585D5A,0xBD4A,0x489E,0xB1,0xF4,0x3D,0xBC,0xB6,0x45,0x2F,0xFB);
+
+MAKE_GUID(IID_IDXGIFactory3,     0x25483823,0xCD46,0x4C7D,0x86,0xCA,0x47,0xAA,0x95,0xB8,0x37,0xBD);
+MAKE_GUID(IID_IDXGIFactory4,     0x1BC6EA02,0xEF36,0x464F,0xBF,0x0C,0x21,0xCA,0x39,0xE5,0x16,0x8A);
+MAKE_GUID(IID_IDXGIFactory5,     0x7632E1F5,0xEE65,0x4DCA,0x87,0xFD,0x84,0xCD,0x75,0xF8,0x83,0x8D);
+MAKE_GUID(IID_IDXGIFactory6,     0xC1B6694F,0xFF09,0x44A9,0xB0,0x3C,0x77,0x90,0x0A,0x0A,0x1D,0x17);
+MAKE_GUID(IID_IDXGIFactory7,     0xA4966EED,0x76DB,0x44DA,0x84,0xC1,0xEE,0x9A,0x7A,0xFB,0x20,0xA8);
+
+MAKE_GUID(IID_IDXGIDevice3,      0x6007896C,0x3244,0x4AFD,0xBF,0x18,0xA6,0xD3,0xBE,0xDA,0x50,0x23);
+MAKE_GUID(IID_IDXGIDevice4,      0x95B4F95F,0xD8DA,0x4CA4,0x9E,0xE6,0x3B,0x76,0xD5,0x96,0x8A,0x10);
+
+/* =========================================================
+ * GUIDs D3D11 / D3D12 — nécessaires pour l'interop D3D12→D3D11
+ * (création d'un device D3D11 caché + ressources partagées)
+ * ========================================================= */
+MAKE_GUID(IID_ID3D11Device,        0xDB6F6DDB,0xAC77,0x4E88,0x82,0x53,0x81,0x9D,0xF9,0xBB,0xF1,0x40);
+MAKE_GUID(IID_ID3D11Device1,       0xA04BFB29,0x08EF,0x43D6,0xA4,0x9C,0xA9,0xBD,0xBD,0xCB,0xE6,0x86);
+MAKE_GUID(IID_ID3D11Texture2D,     0x6F15AAF2,0xD208,0x4E89,0x9A,0xB4,0x48,0x95,0x35,0xD3,0x4F,0x9C);
+MAKE_GUID(IID_ID3D11Resource,      0xDC8E63F3,0xD12B,0x4952,0xB4,0x7B,0x5E,0x45,0x02,0x6A,0x86,0x2D);
+/* IID_IDXGIResource1 déjà défini par <dxgi1_2.h> (mingw) */
+
+MAKE_GUID(IID_ID3D12Device,        0x189819F1,0x1DB6,0x4B57,0xBE,0x54,0x18,0x21,0x33,0x9B,0x85,0xF7);
+MAKE_GUID(IID_ID3D12CommandQueue,  0x0EC870A6,0x5D7E,0x4C22,0x8C,0xFC,0x5B,0xAA,0xE0,0x76,0x16,0xED);
+MAKE_GUID(IID_ID3D12InfoQueue,     0x0742A90B,0xC387,0x483F,0xB9,0x46,0x30,0xA7,0xE4,0xE6,0x14,0x58);
+/* ID3D12Resource : requis pour OpenSharedHandle côté D3D12 */
+MAKE_GUID(IID_ID3D12Resource,      0x696442BE,0xA72E,0x4059,0xBC,0x79,0x5B,0x5C,0x98,0x04,0x0F,0xAD);
+
+/* D3D12_MESSAGE (d3d12sdklayers.h) — pour dumper les erreurs du debug layer */
+typedef struct _D3D12_MESSAGE_MIN {
+    UINT Category;
+    UINT Severity;
+    UINT ID;
+    LPCSTR pDescription;
+    SIZE_T DescriptionByteLength;
+} D3D12_MESSAGE_MIN;
+/* ID3D12InfoQueue vtable (hérite de IUnknown directement) :
+ * 0:QI 1:AddRef 2:Release 3:SetMessageCountLimit 4:ClearStoredMessages
+ * 5:GetMessage(=0x28) ... 8:GetNumStoredMessages(=0x40) */
+#define D3D12IQ_GetMessage_OFF          0x28
+#define D3D12IQ_GetNumStoredMessages_OFF 0x40
+
+/* Dump les messages du debug layer D3D12 (si activé) dans le log, et les
+ * vide ensuite. Pas d'effet si pD3D12Dev ne supporte pas ID3D12InfoQueue
+ * (debug layer non activé par le jeu).
+ * NOTE : implémentation plus bas dans le fichier (après la macro VS). */
+static void D3D12_DumpInfoQueue(IUnknown *pD3D12Dev);
+
+/* D3D_DRIVER_TYPE / D3D_FEATURE_LEVEL minimal */
+typedef enum { D3D_DRIVER_TYPE_UNKNOWN_=0, D3D_DRIVER_TYPE_HARDWARE_=1 } D3D_DRIVER_TYPE_;
+typedef UINT D3D_FEATURE_LEVEL_;
+#define D3D_FEATURE_LEVEL_11_0_  0xb000
+#define D3D_FEATURE_LEVEL_11_1_  0xb100
+#define D3D11_SDK_VERSION_ 7
+
+/* Prototype D3D11CreateDevice (résolu dynamiquement via GetProcAddress) */
+typedef HRESULT (WINAPI *PFN_D3D11CreateDevice)(
+    IUnknown *pAdapter, D3D_DRIVER_TYPE_ DriverType, HMODULE Software, UINT Flags,
+    const D3D_FEATURE_LEVEL_ *pFeatureLevels, UINT FeatureLevels, UINT SDKVersion,
+    void **ppDevice, D3D_FEATURE_LEVEL_ *pFeatureLevel, void **ppImmediateContext);
+
+/* DXGI_RESOURCE_PRIV_DATA pour CreateSharedHandle / OpenSharedResource :
+ * on travaille avec le NT HANDLE (DXGI_SHARED_RESOURCE_*). */
+typedef struct _D3D11_TEXTURE2D_DESC_MIN {
+    UINT Width, Height;
+    UINT MipLevels, ArraySize;
+    DXGI_FORMAT Format;
+    DXGI_SAMPLE_DESC SampleDesc;
+    UINT Usage;       /* D3D11_USAGE */
+    UINT BindFlags;   /* D3D11_BIND_FLAG */
+    UINT CPUAccessFlags;
+    UINT MiscFlags;   /* D3D11_RESOURCE_MISC_FLAG */
+} D3D11_TEXTURE2D_DESC_MIN;
+
+#define D3D11_USAGE_DEFAULT_              0
+#define D3D11_BIND_RENDER_TARGET_         0x20
+#define D3D11_BIND_SHADER_RESOURCE_       0x8
+#define D3D11_RESOURCE_MISC_SHARED_       0x2
+#define D3D11_RESOURCE_MISC_SHARED_NTHANDLE_ 0x800
+
+/* =========================================================
+ * Structures D3D12 minimales — pour CreateCommittedResource +
+ * CreateSharedHandle, utilisées par l'interop D3D12→D3D11.
+ * Layouts identiques à d3d12.h (vérifiés vs SDK), en C pur.
+ * ========================================================= */
+typedef enum {
+    D3D12_HEAP_TYPE_DEFAULT_  = 1,
+} D3D12_HEAP_TYPE_;
+
+typedef enum {
+    D3D12_CPU_PAGE_PROPERTY_UNKNOWN_ = 0,
+} D3D12_CPU_PAGE_PROPERTY_;
+
+typedef enum {
+    D3D12_MEMORY_POOL_UNKNOWN_ = 0,
+} D3D12_MEMORY_POOL_;
+
+typedef struct _D3D12_HEAP_PROPERTIES_MIN {
+    D3D12_HEAP_TYPE_ Type;
+    D3D12_CPU_PAGE_PROPERTY_ CPUPageProperty;
+    D3D12_MEMORY_POOL_ MemoryPoolPreference;
+    UINT CreationNodeMask;
+    UINT VisibleNodeMask;
+} D3D12_HEAP_PROPERTIES_MIN;
+
+typedef enum {
+    D3D12_HEAP_FLAG_NONE_   = 0,
+    D3D12_HEAP_FLAG_SHARED_ = 0x1,  /* corrigé : 0x1, et non 0x20 (= SHARED_CROSS_ADAPTER) */
+} D3D12_HEAP_FLAGS_;
+
+typedef enum {
+    D3D12_RESOURCE_DIMENSION_TEXTURE2D_ = 3,
+} D3D12_RESOURCE_DIMENSION_;
+
+typedef enum {
+    D3D12_TEXTURE_LAYOUT_UNKNOWN_   = 0,
+    D3D12_TEXTURE_LAYOUT_ROW_MAJOR_ = 1,
+} D3D12_TEXTURE_LAYOUT_;
+
+typedef enum {
+    D3D12_RESOURCE_FLAG_NONE_                  = 0,
+    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET_   = 0x1,  /* corrigé : 0x1, et non 0x4 (= ALLOW_UNORDERED_ACCESS) */
+    D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS_ = 0x20, /* corrigé : 0x20, et non 0x8 (= DENY_SHADER_RESOURCE) */
+} D3D12_RESOURCE_FLAGS_;
+
+/* D3D12_CLEAR_VALUE minimal (Format + union Color[4]/DepthStencil) */
+typedef struct _D3D12_CLEAR_VALUE_MIN {
+    DXGI_FORMAT Format;
+    FLOAT Color[4];
+} D3D12_CLEAR_VALUE_MIN;
+
+typedef struct _D3D12_RESOURCE_DESC_MIN {
+    D3D12_RESOURCE_DIMENSION_ Dimension;
+    UINT64 Alignment;
+    UINT64 Width;
+    UINT   Height;
+    UINT16 DepthOrArraySize;
+    UINT16 MipLevels;
+    DXGI_FORMAT Format;
+    DXGI_SAMPLE_DESC SampleDesc;
+    D3D12_TEXTURE_LAYOUT_ Layout;
+    D3D12_RESOURCE_FLAGS_ Flags;
+} D3D12_RESOURCE_DESC_MIN;
+
+typedef enum {
+    D3D12_RESOURCE_STATE_COMMON_           = 0,
+    D3D12_RESOURCE_STATE_RENDER_TARGET_    = 0x4,
+    D3D12_RESOURCE_STATE_COPY_SOURCE_      = 0x800,
+} D3D12_RESOURCE_STATES_;
+
+/* ID3D12Device vtable (slots après IUnknown+ID3D12Object, offsets en x64) :
+ *  0x00 QI,0x08 AddRef,0x10 Release
+ *  0x18 GetPrivateData,0x20 SetPrivateData,0x28 SetPrivateDataInterface,0x30 SetName
+ *  0x38 GetDeviceRemovedReason
+ *  0x40 GetImmediateContext / ... (en réalité D3D12: pas d'ImmediateContext)
+ * Ordre réel ID3D12Device (depuis d3d12.h, après ID3D12Object) :
+ *  GetNodeCount=0x38, CreateCommandQueue=0x40, CreateCommandAllocator=0x48,
+ *  CreateGraphicsPipelineState=0x50, CreateComputePipelineState=0x58,
+ *  CreateCommandList=0x60, CheckFeatureSupport=0x68, CreateDescriptorHeap=0x70,
+ *  GetDescriptorHandleIncrementSize=0x78, CreateRootSignature=0x80,
+ *  CreateConstantBufferView=0x88, CreateShaderResourceView=0x90,
+ *  CreateUnorderedAccessView=0x98, CreateRenderTargetView=0xA0,
+ *  CreateDepthStencilView=0xA8, CreateSampler=0xB0, CopyDescriptors=0xB8,
+ *  CopyDescriptorsSimple=0xC0, GetResourceAllocationInfo=0xC8,
+ *  GetCustomHeapProperties=0xD0, CreateCommittedResource=0xD8,
+ *  CreateHeap=0xE0, CreatePlacedResource=0xE8, CreateReservedResource=0xF0,
+ *  CreateSharedHandle=0xF8, OpenSharedHandle=0x100, OpenSharedHandleByName=0x108,
+ *  MakeResident=0x110, Evict=0x118, CreateFence=0x120, GetDeviceRemovedReason=0x128,
+ *  GetCopyableFootprints=0x130, CreateQueryHeap=0x138, SetStablePowerState=0x140,
+ *  CreateCommandSignature=0x148, GetResourceTiling=0x150, GetAdapterLuid=0x158
+ */
+#define D3D12DEV_CreateCommittedResource_OFF 0xD8
+#define D3D12DEV_CreateSharedHandle_OFF      0xF8
+#define D3D12DEV_OpenSharedHandle_OFF        0x100
+
+/* ID3D12Resource hérite de ID3D12Pageable <- ID3D12DeviceChild <- ID3D12Object <- IUnknown
+ * ID3D12Object: GetPrivateData=0x18,SetPrivateData=0x20,SetPrivateDataInterface=0x28,SetName=0x30
+ * ID3D12DeviceChild: GetDevice=0x38
+ * ID3D12Resource: Map=0x40,Unmap=0x48,GetDesc=0x50,GetGPUVirtualAddress=0x58, ... */
+#define D3D12RES_GetDevice_OFF  0x38
+#define D3D12CQ_GetDevice_OFF   0x38  /* ID3D12CommandQueue hérite aussi de ID3D12Pageable->...->ID3D12Object */
+
+
+static BOOL GuidEq(REFIID a, const GUID *b)
+{
+    return (a->Data1 == b->Data1 && a->Data2 == b->Data2 && a->Data3 == b->Data3
+        && ((const UINT64*)a->Data4)[0] == ((const UINT64*)b->Data4)[0]);
+}
+
+/* GUID → string pour le logging */
+static const char* GuidName(REFIID riid)
+{
+#define G(n) if(GuidEq(riid,&IID_##n)) return #n
+    G(IUnknown_); G(IDXGIObject); G(IDXGIAdapter); G(IDXGIAdapter1);
+    G(IDXGIAdapter2); G(IDXGIAdapter3); G(IDXGIAdapter4);
+    G(IDXGIOutput); G(IDXGIOutput1); G(IDXGIOutput2); G(IDXGIOutput3);
+    G(IDXGIOutput4); G(IDXGIOutput5); G(IDXGIOutput6);
+    G(IDXGISwapChain); G(IDXGISwapChain1); G(IDXGISwapChain2);
+    G(IDXGISwapChain3); G(IDXGISwapChain4);
+    G(IDXGIFactory); G(IDXGIFactory1); G(IDXGIFactory2); G(IDXGIFactory3);
+    G(IDXGIFactory4); G(IDXGIFactory5); G(IDXGIFactory6); G(IDXGIFactory7);
+    G(IDXGIDevice); G(IDXGIDevice1); G(IDXGIDevice2); G(IDXGIDevice3); G(IDXGIDevice4);
+    G(IDXGISurface); G(IDXGISurface1); G(IDXGISurface2);
+    G(IDXGIResource); G(IDXGIResource1); G(IDXGIKeyedMutex);
+#undef G
+    return "?Unknown?";
+}
+
+/* GUID -> chaîne hex complète "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}" + nom connu si dispo.
+ * Utilise un buffer statique thread-local-ish (suffisant pour du logging séquentiel) */
+static const char* GuidNameRaw(REFIID riid)
+{
+    static char buf[160];
+    if(!riid) { return "(null riid)"; }
+    _snprintf(buf,sizeof(buf)-1,
+        "{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X} (%s)",
+        riid->Data1, riid->Data2, riid->Data3,
+        riid->Data4[0], riid->Data4[1],
+        riid->Data4[2], riid->Data4[3], riid->Data4[4],
+        riid->Data4[5], riid->Data4[6], riid->Data4[7],
+        GuidName(riid));
+    buf[sizeof(buf)-1]=0;
+    return buf;
+}
+#define LOG_GUID(label,riid) LOG("%s riid=%s",(label),GuidNameRaw(riid))
+
+/* =========================================================
+ * Types de pointeurs de fonctions — dxgi_real.dll
+ * ========================================================= */
+typedef HRESULT (WINAPI *PFN_CreateDXGIFactory )(REFIID, void**);
+typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1)(REFIID, void**);
+typedef HRESULT (WINAPI *PFN_CreateDXGIFactory2)(UINT,   REFIID, void**);
+
+/* =========================================================
+ * Types de pointeurs D3DKMT (gdi32.dll)
+ * Structures minimales (pas de dépendance WDK)
+ * ========================================================= */
+typedef UINT D3DKMT_HANDLE;
+typedef struct { UINT Value; } D3DKMT_SETPROCESSDEVICEREMOVALSUPPORT;
+typedef struct { D3DKMT_HANDLE hAdapter; UINT VidPnSourceId; } D3DKMT_CHECKVIDPNEXCLUSIVEOWNERSHIP;
+typedef struct { D3DKMT_HANDLE hAdapter; UINT VidPnSourceId; } D3DKMT_WAITFORVERTICALBLANKEVENT;
+typedef struct { D3DKMT_HANDLE hAdapter; UINT VidPnSourceId; UINT NumObjects; HANDLE Handles[8]; } D3DKMT_WAITFORVERTICALBLANKEVENT2;
+typedef NTSTATUS (APIENTRY *PFN_D3DKMTSetProcessDeviceRemovalSupport)(const D3DKMT_SETPROCESSDEVICEREMOVALSUPPORT*);
+typedef NTSTATUS (APIENTRY *PFN_D3DKMTCheckVidPnExclusiveOwnership)(const D3DKMT_CHECKVIDPNEXCLUSIVEOWNERSHIP*);
+typedef NTSTATUS (APIENTRY *PFN_D3DKMTWaitForVerticalBlankEvent)(const D3DKMT_WAITFORVERTICALBLANKEVENT*);
+typedef NTSTATUS (APIENTRY *PFN_D3DKMTWaitForVerticalBlankEvent2)(const D3DKMT_WAITFORVERTICALBLANKEVENT2*);
+
+
+/* WNF */
+typedef ULONG64 WNF_STATE_NAME;
+typedef NTSTATUS (NTAPI *WNF_USER_CALLBACK)(WNF_STATE_NAME,ULONG,PVOID,PVOID,PVOID,ULONG);
+typedef PVOID WNF_SUBSCRIPTION_HANDLE;
+typedef NTSTATUS (NTAPI *PFN_RtlSubscribeWnf)(WNF_SUBSCRIPTION_HANDLE*,WNF_STATE_NAME,ULONG,PVOID,WNF_USER_CALLBACK,PVOID,ULONG,ULONG);
+typedef NTSTATUS (NTAPI *PFN_RtlUnsubscribeWnf)(WNF_SUBSCRIPTION_HANDLE);
+typedef NTSTATUS (NTAPI *PFN_RtlQueryWnfStateData)(PULONG,WNF_STATE_NAME,WNF_USER_CALLBACK,PVOID,PVOID);
+typedef NTSTATUS (NTAPI *PFN_RtlUnsubscribeWnfWait)(WNF_SUBSCRIPTION_HANDLE);
+
+/* =========================================================
+ * État global
+ * ========================================================= */
+
+/* dxgi_real.dll */
+static HMODULE               g_hDxgiReal     = NULL;
+static PFN_CreateDXGIFactory  g_pfnFactory    = NULL;
+static PFN_CreateDXGIFactory1 g_pfnFactory1   = NULL;
+static PFN_CreateDXGIFactory2 g_pfnFactory2   = NULL;
+
+/* gdi32.dll — D3DKMT */
+static PFN_D3DKMTSetProcessDeviceRemovalSupport g_D3DKMTSetProcessDeviceRemovalSupport = NULL;
+static PFN_D3DKMTCheckVidPnExclusiveOwnership   g_D3DKMTCheckVidPnExclusiveOwnership   = NULL;
+static PFN_D3DKMTWaitForVerticalBlankEvent      g_D3DKMTWaitForVerticalBlankEvent      = NULL;
+static PFN_D3DKMTWaitForVerticalBlankEvent2     g_D3DKMTWaitForVerticalBlankEvent2     = NULL;
+
+/* ntdll — WNF (NULL sur Win7) */
+static PFN_RtlSubscribeWnf        g_pfnRtlSubscribeWnf        = NULL;
+static PFN_RtlUnsubscribeWnf      g_pfnRtlUnsubscribeWnf      = NULL;
+static PFN_RtlQueryWnfStateData   g_pfnRtlQueryWnfStateData   = NULL;
+static PFN_RtlUnsubscribeWnfWait  g_pfnRtlUnsubscribeWnfWait  = NULL;
+
+/* Chemin EXE hôte */
+static LPWSTR g_pExePath = NULL;
+static LPWSTR g_pExeDir  = NULL;
+
+/* AppCompat */
+static volatile PVOID g_pCompatBase   = NULL;
+static volatile PVOID g_pCompatSecond = NULL;
+#define COMPAT_BUF_SZ 512
+static char             g_szCompatBuf[COMPAT_BUF_SZ];
+static SIZE_T           g_cbCompatBuf  = 0;
+static BOOL             g_bCompatBuilt = FALSE;
+static CRITICAL_SECTION g_csCompat;
+
+/* Journal ring (DXGIDumpJournal) — layout exact Ghidra :
+   DAT_1800cbec0+lVar2 : type(4), arg1(4), arg2(4), arg3(4), ts(8), msg(0x60)
+   total = 0x78 octets par entrée, 0x40 entrées */
+#define JOURNAL_N    0x40
+#define JOURNAL_SZ   0x78
+typedef struct { UINT type; UINT arg1; UINT arg2; UINT arg3; UINT64 ts; char msg[0x60]; } JOURNAL_ENTRY;
+static JOURNAL_ENTRY g_Journal[JOURNAL_N];
+static volatile int  g_JournalHead = 0;
+
+/* HMD — lock global (DAT_1800cdda8) + pointer manager (DAT_1800cde00) */
+static CRITICAL_SECTION g_csHMD;
+/* On stocke un pointeur vers le WrapFactory actif pour UpdateHMD */
+static volatile PVOID   g_pActiveFactory = NULL; /* set lors de CreateDXGIFactory* */
+
+/* ApplyCompatResolutionQuirking — InitOnce */
+static INIT_ONCE g_InitOnceCompat = INIT_ONCE_STATIC_INIT;
+static BOOL  g_bCompatResQuirkSet = FALSE;
+static DWORD g_dwNativeW = 0, g_dwNativeH = 0;
+static DWORD g_dwLogicW  = 0, g_dwLogicH  = 0;
+
+/* =========================================================
+ * Private Data Store (pour les wrappers COM)
+ * Reproduit le layout exact de la dxgi Win10
+ * ========================================================= */
+typedef struct _PRIVENTRY {
+    struct _PRIVENTRY *pNext;
+    GUID               Guid;    /* 16 octets */
+    UINT               DataSz;
+    BOOL               bIsUnk;
+    union { BYTE *pData; IUnknown *pUnk; };
+} PRIVENTRY;
+
+static void PrivData_Free(PRIVENTRY *p)
+{
+    if (!p) return;
+    if (p->bIsUnk) { if (p->pUnk) p->pUnk->lpVtbl->Release(p->pUnk); }
+    else           { if (p->pData) HeapFree(GetProcessHeap(),0,p->pData); }
+    HeapFree(GetProcessHeap(),0,p);
+}
+
+static PRIVENTRY** PrivData_Find(PRIVENTRY **ppHead, REFIID g)
+{
+    PRIVENTRY **pp = ppHead;
+    while (*pp) {
+        if (GuidEq(&(*pp)->Guid, g)) return pp;
+        pp = &(*pp)->pNext;
+    }
+    return NULL;
+}
+
+static HRESULT PrivData_Set(PRIVENTRY **ppHead, CRITICAL_SECTION *pcs,
+                             REFIID guid, UINT sz, const void *pData)
+{
+    PRIVENTRY **pp, *e;
+    EnterCriticalSection(pcs);
+    pp = PrivData_Find(ppHead, guid);
+    if (!sz || !pData) {
+        if (pp) { e=*pp; *pp=e->pNext; PrivData_Free(e); }
+        LeaveCriticalSection(pcs); return S_OK;
+    }
+    if (sz && !pData) { LeaveCriticalSection(pcs); return DXGI_ERROR_INVALID_CALL; }
+    if (pp) {
+        e = *pp;
+        if (e->bIsUnk && e->pUnk) e->pUnk->lpVtbl->Release(e->pUnk);
+        else if (e->pData) HeapFree(GetProcessHeap(),0,e->pData);
+        e->pData=NULL; e->bIsUnk=FALSE;
+    } else {
+        e = HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,sizeof(*e));
+        if (!e) { LeaveCriticalSection(pcs); return E_OUTOFMEMORY; }
+        memcpy(&e->Guid,guid,sizeof(GUID));
+        e->pNext=*ppHead; *ppHead=e;
+    }
+    e->pData = HeapAlloc(GetProcessHeap(),0,sz);
+    if (!e->pData) {
+        if (!pp) { *ppHead=e->pNext; HeapFree(GetProcessHeap(),0,e); }
+        LeaveCriticalSection(pcs); return E_OUTOFMEMORY;
+    }
+    memcpy(e->pData,pData,sz); e->DataSz=sz; e->bIsUnk=FALSE;
+    LeaveCriticalSection(pcs); return S_OK;
+}
+
+static HRESULT PrivData_SetUnk(PRIVENTRY **ppHead, CRITICAL_SECTION *pcs,
+                                REFIID guid, const IUnknown *pUnk)
+{
+    PRIVENTRY **pp, *e;
+    EnterCriticalSection(pcs);
+    pp = PrivData_Find(ppHead, guid);
+    if (!pUnk) {
+        if (pp) { e=*pp; *pp=e->pNext; PrivData_Free(e); }
+        LeaveCriticalSection(pcs); return S_OK;
+    }
+    if (pp) {
+        e = *pp;
+        if (e->bIsUnk && e->pUnk) e->pUnk->lpVtbl->Release(e->pUnk);
+        else if (e->pData) HeapFree(GetProcessHeap(),0,e->pData);
+        e->pData=NULL;
+    } else {
+        e = HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,sizeof(*e));
+        if (!e) { LeaveCriticalSection(pcs); return E_OUTOFMEMORY; }
+        memcpy(&e->Guid,guid,sizeof(GUID));
+        e->pNext=*ppHead; *ppHead=e;
+    }
+    ((IUnknown*)pUnk)->lpVtbl->AddRef((IUnknown*)pUnk);
+    e->pUnk=((IUnknown*)pUnk); e->DataSz=sizeof(IUnknown*); e->bIsUnk=TRUE;
+    LeaveCriticalSection(pcs); return S_OK;
+}
+
+static HRESULT PrivData_Get(PRIVENTRY **ppHead, CRITICAL_SECTION *pcs,
+                             REFIID guid, UINT *pSz, void *pDst)
+{
+    PRIVENTRY **pp; HRESULT hr=DXGI_ERROR_NOT_FOUND;
+    EnterCriticalSection(pcs);
+    pp = PrivData_Find(ppHead, guid);
+    if (pp) {
+        PRIVENTRY *e=*pp;
+        UINT need = e->bIsUnk ? sizeof(IUnknown*) : e->DataSz;
+        if (!pDst) { *pSz=need; hr=S_OK; }
+        else if (*pSz < need) { *pSz=need; hr=DXGI_ERROR_MORE_DATA; }
+        else if (e->bIsUnk) {
+            e->pUnk->lpVtbl->AddRef(e->pUnk);
+            *(IUnknown**)pDst=e->pUnk; *pSz=sizeof(IUnknown*); hr=S_OK;
+        } else {
+            memcpy(pDst,e->pData,e->DataSz); *pSz=e->DataSz; hr=S_OK;
+        }
+    }
+    LeaveCriticalSection(pcs); return hr;
+}
+
+static void PrivData_DestroyAll(PRIVENTRY **ppHead, CRITICAL_SECTION *pcs)
+{
+    PRIVENTRY *p, *n;
+    EnterCriticalSection(pcs);
+    p=*ppHead; *ppHead=NULL;
+    LeaveCriticalSection(pcs);
+    while (p) { n=p->pNext; PrivData_Free(p); p=n; }
+}
+
+/* =========================================================
+ * Macro vtable dispatch (accès brut par offset en octets)
+ * ========================================================= */
+#define VTBL(obj)           (*(void***)(obj))
+#define VCALL0(obj,off)     ((HRESULT(STDMETHODCALLTYPE*)(void*))VTBL(obj)[(off)/8])(obj)
+/* VCALL1 : void* pour l'arg — sûr en x64 ms_abi pour tous pointeurs */
+#define VCALL1(obj,off,a)   ((HRESULT(STDMETHODCALLTYPE*)(void*,void*))VTBL(obj)[(off)/8])(obj,(void*)(a))
+/* VS : accès brut à un slot vtable, le cast se fait au call site */
+#define VS(obj,off)         (VTBL(obj)[(off)/8])
+
+/* Implémentation de D3D12_DumpInfoQueue (déclarée plus haut, après les
+ * GUIDs/structs D3D12) — placée ici car elle dépend de la macro VS. */
+static void D3D12_DumpInfoQueue(IUnknown *pD3D12Dev)
+{
+    typedef UINT64(STDMETHODCALLTYPE*PFN_GetNum)(void*);
+    typedef HRESULT(STDMETHODCALLTYPE*PFN_GetMsg)(void*,UINT64,D3D12_MESSAGE_MIN*,SIZE_T*);
+    typedef void(STDMETHODCALLTYPE*PFN_Clear)(void*);
+    void *pIQ=NULL;
+    if(!pD3D12Dev) return;
+    if(FAILED(pD3D12Dev->lpVtbl->QueryInterface(pD3D12Dev,&IID_ID3D12InfoQueue,&pIQ)) || !pIQ) {
+        LOG("  D3D12_DumpInfoQueue: ID3D12InfoQueue non disponible (debug layer non activé ?)");
+        return;
+    }
+    {
+        UINT64 n=((PFN_GetNum)VS(pIQ,D3D12IQ_GetNumStoredMessages_OFF))(pIQ);
+        UINT64 i;
+        LOG("  D3D12_DumpInfoQueue: %llu message(s) stocké(s)",(unsigned long long)n);
+        for(i=0;i<n;i++) {
+            SIZE_T len=0;
+            ((PFN_GetMsg)VS(pIQ,D3D12IQ_GetMessage_OFF))(pIQ,i,NULL,&len);
+            if(len==0) continue;
+            {
+                D3D12_MESSAGE_MIN *m=(D3D12_MESSAGE_MIN*)HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,len);
+                if(!m) continue;
+                if(SUCCEEDED(((PFN_GetMsg)VS(pIQ,D3D12IQ_GetMessage_OFF))(pIQ,i,m,&len))) {
+                    LOG("  D3D12 MSG[%llu] cat=%u sev=%u id=%u: %s",
+                        (unsigned long long)i,m->Category,m->Severity,m->ID,
+                        m->pDescription?m->pDescription:"(null)");
+                }
+                HeapFree(GetProcessHeap(),0,m);
+            }
+        }
+    }
+    ((PFN_Clear)VS(pIQ,4*8))(pIQ); /* ClearStoredMessages, slot 4 = 0x20 */
+    ((IUnknown*)pIQ)->lpVtbl->Release((IUnknown*)pIQ);
+}
+
+
+/* =========================================================
+ * ==================== WRAPPERS COM =======================
+ *
+ * Structure de base commune : DXGIBASE
+ * Tous les wrappers commencent par ce bloc.
+ * ========================================================= */
+typedef struct _DXGIBASE {
+    void              *pVtbl;       /* 0x00 : pointeur vtable */
+    volatile LONG      lRef;        /* 0x08 : ref count atomique */
+    IUnknown          *pReal;       /* 0x10 : interface réelle (dxgi_real) */
+    PRIVENTRY         *pPriv;       /* 0x18 : liste private data */
+    CRITICAL_SECTION   csPriv;      /* 0x20 */
+} DXGIBASE;
+
+static void Base_Init(DXGIBASE *b, void *vtbl, IUnknown *pReal)
+{
+    b->pVtbl = vtbl;
+    b->lRef  = 1;
+    b->pReal = pReal;
+    b->pPriv = NULL;
+    InitializeCriticalSection(&b->csPriv);
+}
+static void Base_Dtor(DXGIBASE *b)
+{
+    PrivData_DestroyAll(&b->pPriv,&b->csPriv);
+    DeleteCriticalSection(&b->csPriv);
+    if (b->pReal) { b->pReal->lpVtbl->Release(b->pReal); b->pReal=NULL; }
+}
+static ULONG Base_AddRef(DXGIBASE *b) { return (ULONG)InterlockedIncrement(&b->lRef); }
+static ULONG Base_Release(DXGIBASE *b, void(*dtor)(DXGIBASE*))
+{
+    LONG n = InterlockedDecrement(&b->lRef);
+    if (!n) { Base_Dtor(b); if(dtor) dtor(b); HeapFree(GetProcessHeap(),0,b); return 0; }
+    return (ULONG)n;
+}
+
+/* =========================================================
+ * Forward-déclarations des fonctions WrapFactory_Create
+ * (nécessaire car CreateDXGIFactory* les appelle avant définition)
+ * ========================================================= */
+static HRESULT WrapFactory_Create(IUnknown *pReal, UINT uFlags, REFIID riid, void **ppOut);
+
+/* =========================================================
+ * ======== SWAPCHAIN WRAPPER ========
+ * Expose IDXGISwapChain..IDXGISwapChain4
+ * ========================================================= */
+/* Contexte d'interop D3D12 → D3D11, alloué seulement si le swapchain
+ * a été créée pour une ID3D12CommandQueue (cf. WF_CreateSwapChainForHwnd). */
+#define D3D12_INTEROP_MAX_BUFFERS 8
+typedef struct _D3D12Interop {
+    void *pD3D11Dev;      /* ID3D11Device*  (device caché) */
+    void *pD3D11Dev1;     /* ID3D11Device1* (pour OpenSharedResource1), peut être NULL */
+    void *pD3D11Ctx;      /* ID3D11DeviceContext* */
+    void *pD3D12Dev;      /* ID3D12Device* (du jeu, ref conservée) */
+    UINT  BufferCount;
+    UINT  Width, Height;
+    DXGI_FORMAT Format;
+    UINT  D3D12ResFlags;  /* D3D12_RESOURCE_FLAGS du swapchain d'origine */
+    UINT  presentIndex;   /* compteur de présentations, pour round-robin des buffers */
+    /*
+     * Pour chaque back buffer logique exposé à l'app D3D12 :
+     *   pD3D11Tex[i]   — ID3D11Texture2D* créée côté D3D11 (possédée par nous,
+     *                    MiscFlags=SHARED, GetSharedHandle utilisé pour le partage)
+     *   pD3D12Res[i]   — ID3D12Resource* ouverte côté D3D12 via OpenSharedHandle
+     *   pD3D11Shared[i]— idem pD3D11Tex[i], doublon conservé pour GetBuffer D3D11
+     *
+     * Note : hShared[] n'est PLUS utilisé. GetSharedHandle() retourne un
+     * pseudo-handle DXGI (pas un vrai HANDLE NT), il ne faut pas CloseHandle.
+     */
+    void *pD3D11Tex   [D3D12_INTEROP_MAX_BUFFERS]; /* ID3D11Texture2D* SHARED (propriétaire) */
+    void *pD3D12Res   [D3D12_INTEROP_MAX_BUFFERS]; /* ID3D12Resource*  (vue D3D12)    */
+    void *pD3D11Shared[D3D12_INTEROP_MAX_BUFFERS]; /* == pD3D11Tex[i], alias pour GetBuffer */
+    /* Textures D3D11 NON-partagées utilisées comme intermédiaire de copie.
+     * CopyResource depuis une texture MISC_SHARED crashe sur Win7 (accès
+     * à des structures de sync WDDM nulles). On copie d'abord SHARED→staging
+     * (deux textures D3D11 normales, même device), puis staging→back buffer. */
+    void *pD3D11Staging[D3D12_INTEROP_MAX_BUFFERS]; /* ID3D11Texture2D* normale (non-partagée) */
+} D3D12Interop;
+
+typedef struct _WrapSC {
+    DXGIBASE base;
+    void    *pReal1;  /* IDXGISwapChain1* ou NULL */
+    void    *pReal2;  /* IDXGISwapChain2* ou NULL */
+    void    *pReal3;  /* IDXGISwapChain3* ou NULL */
+    void    *pReal4;  /* IDXGISwapChain4* ou NULL */
+    D3D12Interop *interop; /* NULL si pas d'interop D3D12 (cas D3D11/D3D9 normal) */
+} WrapSC;
+
+/* Forward declarations interop D3D12 */
+static D3D12Interop* D3D12Interop_Create(IUnknown *pD3D12CQ, HWND hwnd,
+    const void *pDesc /* DXGI_SWAP_CHAIN_DESC1* */, IUnknown **ppRealSC);
+static void D3D12Interop_Destroy(D3D12Interop *it);
+static HRESULT D3D12Interop_GetBuffer(WrapSC *w, UINT Buf, REFIID riid, void **pp);
+static HRESULT D3D12Interop_Present(WrapSC *w, UINT SyncInterval, UINT Flags, HRESULT *outHr);
+
+/* Forward declarations vtable SC */
+static HRESULT STDMETHODCALLTYPE SC_QI      (WrapSC*,REFIID,void**);
+static ULONG   STDMETHODCALLTYPE SC_AddRef  (WrapSC*);
+static ULONG   STDMETHODCALLTYPE SC_Release (WrapSC*);
+static HRESULT STDMETHODCALLTYPE SC_SetPriv (WrapSC*,REFGUID,UINT,const void*);
+static HRESULT STDMETHODCALLTYPE SC_SetPrivUnk(WrapSC*,REFGUID,const IUnknown*);
+static HRESULT STDMETHODCALLTYPE SC_GetPriv (WrapSC*,REFGUID,UINT*,void*);
+static HRESULT STDMETHODCALLTYPE SC_GetParent(WrapSC*,REFIID,void**);
+/* IDXGISwapChain méthodes — délégation brute à pReal */
+static HRESULT STDMETHODCALLTYPE SC_Present           (WrapSC*,UINT,UINT);
+static HRESULT STDMETHODCALLTYPE SC_GetBuffer         (WrapSC*,UINT,REFIID,void**);
+static HRESULT STDMETHODCALLTYPE SC_SetFullscreenState(WrapSC*,BOOL,void*);
+static HRESULT STDMETHODCALLTYPE SC_GetFullscreenState(WrapSC*,BOOL*,void**);
+static HRESULT STDMETHODCALLTYPE SC_GetDesc           (WrapSC*,void*);
+static HRESULT STDMETHODCALLTYPE SC_ResizeBuffers     (WrapSC*,UINT,UINT,UINT,UINT,UINT);
+static HRESULT STDMETHODCALLTYPE SC_ResizeTarget      (WrapSC*,const void*);
+static HRESULT STDMETHODCALLTYPE SC_GetContainingOutput(WrapSC*,void**);
+static HRESULT STDMETHODCALLTYPE SC_GetFrameStatistics(WrapSC*,void*);
+static HRESULT STDMETHODCALLTYPE SC_GetLastPresentCount(WrapSC*,UINT*);
+/* IDXGISwapChain1 */
+static HRESULT STDMETHODCALLTYPE SC_GetDesc1             (WrapSC*,void*);
+static HRESULT STDMETHODCALLTYPE SC_GetFullscreenDesc    (WrapSC*,void*);
+static HRESULT STDMETHODCALLTYPE SC_GetHwnd              (WrapSC*,HWND*);
+static HRESULT STDMETHODCALLTYPE SC_GetCoreWindow        (WrapSC*,REFIID,void**);
+static HRESULT STDMETHODCALLTYPE SC_Present1             (WrapSC*,UINT,UINT,const void*);
+static BOOL    STDMETHODCALLTYPE SC_IsTemporaryMonoSupported(WrapSC*);
+static HRESULT STDMETHODCALLTYPE SC_GetRestrictToOutput  (WrapSC*,void**);
+static HRESULT STDMETHODCALLTYPE SC_SetBackgroundColor   (WrapSC*,const void*);
+static HRESULT STDMETHODCALLTYPE SC_GetBackgroundColor   (WrapSC*,void*);
+static HRESULT STDMETHODCALLTYPE SC_SetRotation          (WrapSC*,UINT);
+static HRESULT STDMETHODCALLTYPE SC_GetRotation          (WrapSC*,UINT*);
+/* IDXGISwapChain2 */
+static HRESULT STDMETHODCALLTYPE SC_SetSourceSize        (WrapSC*,UINT,UINT);
+static HRESULT STDMETHODCALLTYPE SC_GetSourceSize        (WrapSC*,UINT*,UINT*);
+static HRESULT STDMETHODCALLTYPE SC_SetMaximumFrameLatency(WrapSC*,UINT);
+static HRESULT STDMETHODCALLTYPE SC_GetMaximumFrameLatency(WrapSC*,UINT*);
+static HANDLE  STDMETHODCALLTYPE SC_GetFrameLatencyWaitableObject(WrapSC*);
+static HRESULT STDMETHODCALLTYPE SC_SetMatrixTransform   (WrapSC*,const void*);
+static HRESULT STDMETHODCALLTYPE SC_GetMatrixTransform   (WrapSC*,void*);
+/* IDXGISwapChain3 */
+static UINT    STDMETHODCALLTYPE SC_GetCurrentBackBufferIndex(WrapSC*);
+static HRESULT STDMETHODCALLTYPE SC_CheckColorSpaceSupport(WrapSC*,UINT,UINT*);
+static HRESULT STDMETHODCALLTYPE SC_SetColorSpace1       (WrapSC*,UINT);
+static HRESULT STDMETHODCALLTYPE SC_ResizeBuffers1       (WrapSC*,UINT,UINT,UINT,UINT,UINT,const UINT*,IUnknown*const*);
+/* IDXGISwapChain4 */
+static HRESULT STDMETHODCALLTYPE SC_SetHDRMetaData       (WrapSC*,UINT,UINT,void*);
+
+static const void* g_SC_Vtbl[] = {
+    SC_QI, SC_AddRef, SC_Release,
+    SC_SetPriv, SC_SetPrivUnk, SC_GetPriv, SC_GetParent,
+    /* IDXGIDeviceSubObject : GetDevice à offset 0x38 */
+    /* (stub: délégue à pReal) */
+    NULL, /* GetDevice — rempli dynamiquement, voir ci-dessous */
+    /* IDXGISwapChain */
+    SC_Present, SC_GetBuffer, SC_SetFullscreenState, SC_GetFullscreenState,
+    SC_GetDesc, SC_ResizeBuffers, SC_ResizeTarget, SC_GetContainingOutput,
+    SC_GetFrameStatistics, SC_GetLastPresentCount,
+    /* IDXGISwapChain1 */
+    SC_GetDesc1, SC_GetFullscreenDesc, SC_GetHwnd, SC_GetCoreWindow,
+    SC_Present1, SC_IsTemporaryMonoSupported, SC_GetRestrictToOutput,
+    SC_SetBackgroundColor, SC_GetBackgroundColor, SC_SetRotation, SC_GetRotation,
+    /* IDXGISwapChain2 */
+    SC_SetSourceSize, SC_GetSourceSize, SC_SetMaximumFrameLatency,
+    SC_GetMaximumFrameLatency, SC_GetFrameLatencyWaitableObject,
+    SC_SetMatrixTransform, SC_GetMatrixTransform,
+    /* IDXGISwapChain3 */
+    SC_GetCurrentBackBufferIndex, SC_CheckColorSpaceSupport,
+    SC_SetColorSpace1, SC_ResizeBuffers1,
+    /* IDXGISwapChain4 */
+    SC_SetHDRMetaData,
+};
+
+static void SC_Dtor(DXGIBASE *b)
+{
+    WrapSC *w=(WrapSC*)b;
+    if(w->interop) { D3D12Interop_Destroy(w->interop); w->interop=NULL; }
+    if(w->pReal4) { ((IUnknown*)w->pReal4)->lpVtbl->Release((IUnknown*)w->pReal4); w->pReal4=NULL; }
+    if(w->pReal3) { ((IUnknown*)w->pReal3)->lpVtbl->Release((IUnknown*)w->pReal3); w->pReal3=NULL; }
+    if(w->pReal2) { ((IUnknown*)w->pReal2)->lpVtbl->Release((IUnknown*)w->pReal2); w->pReal2=NULL; }
+    if(w->pReal1) { ((IUnknown*)w->pReal1)->lpVtbl->Release((IUnknown*)w->pReal1); w->pReal1=NULL; }
+}
+
+static HRESULT WrapSC_Create2(IUnknown *pReal, REFIID riid, void **ppOut, WrapSC **ppWrapOut)
+{
+    WrapSC *w; HRESULT hr;
+    LOG("WrapSC_Create riid=%s", GuidName(riid));
+    if (!ppOut) return E_INVALIDARG;
+    *ppOut=NULL;
+    if (!pReal) return E_INVALIDARG;
+    w = HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,sizeof(*w));
+    if (!w) return E_OUTOFMEMORY;
+    pReal->lpVtbl->AddRef(pReal); /* ownership explicite pour Base_Init */
+    Base_Init(&w->base,(void*)g_SC_Vtbl,pReal);
+    pReal->lpVtbl->QueryInterface(pReal,&IID_IDXGISwapChain1,&w->pReal1);
+    pReal->lpVtbl->QueryInterface(pReal,&IID_IDXGISwapChain2,&w->pReal2);
+    pReal->lpVtbl->QueryInterface(pReal,&IID_IDXGISwapChain3,&w->pReal3);
+    pReal->lpVtbl->QueryInterface(pReal,&IID_IDXGISwapChain4,&w->pReal4);
+    hr = SC_QI(w,riid,ppOut);
+    if(ppWrapOut) *ppWrapOut = SUCCEEDED(hr) ? w : NULL;
+    SC_Release(w); /* retire la ref de création du wrapper (le QI ci-dessus en a pris une 2e si succès) */
+    return hr;
+}
+static HRESULT WrapSC_Create(IUnknown *pReal, REFIID riid, void **ppOut)
+{
+    return WrapSC_Create2(pReal,riid,ppOut,NULL);
+}
+
+static HRESULT STDMETHODCALLTYPE SC_QI(WrapSC *w, REFIID riid, void **ppv)
+{
+    LOG("IDXGISwapChain::QI(%s)", GuidName(riid));
+    if (!ppv) return E_INVALIDARG; *ppv=NULL;
+    if (GuidEq(riid,&IID_IUnknown_)      || GuidEq(riid,&IID_IDXGIObject)    ||
+        GuidEq(riid,&IID_IDXGIDeviceSubObj)||GuidEq(riid,&IID_IDXGISwapChain))
+        { *ppv=w; SC_AddRef(w); return S_OK; }
+    if (GuidEq(riid,&IID_IDXGISwapChain1) && (w->pReal1 || w->interop))
+        { *ppv=w; SC_AddRef(w); return S_OK; }
+    if (GuidEq(riid,&IID_IDXGISwapChain2) && (w->pReal2 || w->interop))
+        { *ppv=w; SC_AddRef(w); return S_OK; }
+    if (GuidEq(riid,&IID_IDXGISwapChain3) && (w->pReal3 || w->interop))
+        { *ppv=w; SC_AddRef(w); return S_OK; }
+    if (GuidEq(riid,&IID_IDXGISwapChain4) && (w->pReal4 || w->interop))
+        { *ppv=w; SC_AddRef(w); return S_OK; }
+    /*
+     * GUID inconnu : déléguer à l'interface réelle.
+     * Cela couvre les IIDs internes privés (ex: interfaces internes
+     * dxgi↔d3d11, dxgi↔nvapi, etc.) que le runtime peut demander
+     * sans que nous les connaissions. Retourner E_NOINTERFACE sans
+     * déléguer ferait planter d3d11.dll qui déréférence le résultat.
+     */
+    LOG("IDXGISwapChain::QI unknown {%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X} → passthrough",
+        riid->Data1, riid->Data2, riid->Data3,
+        riid->Data4[0], riid->Data4[1],
+        riid->Data4[2], riid->Data4[3], riid->Data4[4],
+        riid->Data4[5], riid->Data4[6], riid->Data4[7]);
+    return w->base.pReal->lpVtbl->QueryInterface(w->base.pReal, riid, ppv);
+}
+static ULONG STDMETHODCALLTYPE SC_AddRef (WrapSC *w){ return Base_AddRef(&w->base); }
+static ULONG STDMETHODCALLTYPE SC_Release(WrapSC *w){ return Base_Release(&w->base,SC_Dtor); }
+static HRESULT STDMETHODCALLTYPE SC_SetPriv(WrapSC*w,REFGUID g,UINT sz,const void*p)
+{ return PrivData_Set(&w->base.pPriv,&w->base.csPriv,g,sz,p); }
+static HRESULT STDMETHODCALLTYPE SC_SetPrivUnk(WrapSC*w,REFGUID g,const IUnknown*p)
+{ return PrivData_SetUnk(&w->base.pPriv,&w->base.csPriv,g,p); }
+static HRESULT STDMETHODCALLTYPE SC_GetPriv(WrapSC*w,REFGUID g,UINT*sz,void*p)
+{ return PrivData_Get(&w->base.pPriv,&w->base.csPriv,g,sz,p); }
+static HRESULT STDMETHODCALLTYPE SC_GetParent(WrapSC*w,REFIID riid,void**pp)
+{
+    /* GetParent sur un SwapChain retourne la Factory */
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,REFIID,void**);
+    LOG("IDXGISwapChain::GetParent(%s)", GuidName(riid));
+    if (!pp) return E_INVALIDARG; *pp=NULL;
+    HRESULT hr = ((PFN)VS(w->base.pReal,0x30))(w->base.pReal,riid,pp);
+    LOG_LEAVE("IDXGISwapChain::GetParent",hr);
+    return hr;
+}
+
+/* Macro pour délégation directe SwapChain → pReal */
+#define SC_DELEGATE(name,off,...) \
+    typedef HRESULT(STDMETHODCALLTYPE*_PFN_##name)(void*,##__VA_ARGS__); \
+    LOG("IDXGISwapChain::" #name); \
+    return ((_PFN_##name)VS(w->base.pReal,(off)))(w->base.pReal
+
+#define SC_DEL_NOARG(name,off) \
+static HRESULT STDMETHODCALLTYPE SC_##name(WrapSC*w) { \
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*); \
+    LOG("IDXGISwapChain::" #name); \
+    HRESULT hr=((PFN)VS(w->base.pReal,(off)))(w->base.pReal); \
+    LOG_LEAVE("IDXGISwapChain::" #name,hr); return hr; }
+
+static HRESULT STDMETHODCALLTYPE SC_Present(WrapSC*w,UINT SyncInterval,UINT Flags)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT,UINT);
+    HRESULT hr;
+    LOG("IDXGISwapChain::Present(sync=%u flags=0x%X)",SyncInterval,Flags);
+    if(w->interop) { D3D12Interop_Present(w,SyncInterval,Flags,&hr); LOG_LEAVE("IDXGISwapChain::Present[interop]",hr); return hr; }
+    hr=((PFN)VS(w->base.pReal,0x40))(w->base.pReal,SyncInterval,Flags);
+    LOG_LEAVE("IDXGISwapChain::Present",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE SC_GetBuffer(WrapSC*w,UINT Buf,REFIID riid,void**pp)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT,REFIID,void**);
+    HRESULT hr;
+    LOG("IDXGISwapChain::GetBuffer(%u,%s)",Buf,GuidName(riid));
+    if(!pp) return E_INVALIDARG; *pp=NULL;
+    if(w->interop) { hr=D3D12Interop_GetBuffer(w,Buf,riid,pp); LOG_LEAVE("IDXGISwapChain::GetBuffer[interop]",hr); return hr; }
+    hr=((PFN)VS(w->base.pReal,0x48))(w->base.pReal,Buf,riid,pp);
+    LOG_LEAVE("IDXGISwapChain::GetBuffer",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE SC_SetFullscreenState(WrapSC*w,BOOL fs,void*pTarget)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,BOOL,void*);
+    LOG("IDXGISwapChain::SetFullscreenState(%d)",fs);
+    HRESULT hr=((PFN)VS(w->base.pReal,0x50))(w->base.pReal,fs,pTarget);
+    LOG_LEAVE("IDXGISwapChain::SetFullscreenState",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE SC_GetFullscreenState(WrapSC*w,BOOL*pFs,void**ppTarget)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,BOOL*,void**);
+    LOG("IDXGISwapChain::GetFullscreenState");
+    HRESULT hr=((PFN)VS(w->base.pReal,0x58))(w->base.pReal,pFs,ppTarget);
+    LOG_LEAVE("IDXGISwapChain::GetFullscreenState",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE SC_GetDesc(WrapSC*w,void*pDesc)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,void*);
+    LOG("IDXGISwapChain::GetDesc");
+    HRESULT hr=((PFN)VS(w->base.pReal,0x60))(w->base.pReal,pDesc);
+    LOG_LEAVE("IDXGISwapChain::GetDesc",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE SC_ResizeBuffers(WrapSC*w,UINT C,UINT W,UINT H,UINT F,UINT Fl)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT,UINT,UINT,UINT,UINT);
+    LOG("IDXGISwapChain::ResizeBuffers(%u,%u,%u,fmt=%u,flags=%u)",C,W,H,F,Fl);
+    HRESULT hr=((PFN)VS(w->base.pReal,0x68))(w->base.pReal,C,W,H,F,Fl);
+    LOG_LEAVE("IDXGISwapChain::ResizeBuffers",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE SC_ResizeTarget(WrapSC*w,const void*pDesc)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,const void*);
+    LOG("IDXGISwapChain::ResizeTarget");
+    HRESULT hr=((PFN)VS(w->base.pReal,0x70))(w->base.pReal,pDesc);
+    LOG_LEAVE("IDXGISwapChain::ResizeTarget",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE SC_GetContainingOutput(WrapSC*w,void**pp)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,void**);
+    LOG("IDXGISwapChain::GetContainingOutput");
+    if(!pp) return E_INVALIDARG; *pp=NULL;
+    HRESULT hr=((PFN)VS(w->base.pReal,0x78))(w->base.pReal,pp);
+    LOG_LEAVE("IDXGISwapChain::GetContainingOutput",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE SC_GetFrameStatistics(WrapSC*w,void*p)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,void*);
+    HRESULT hr=((PFN)VS(w->base.pReal,0x80))(w->base.pReal,p);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE SC_GetLastPresentCount(WrapSC*w,UINT*p)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT*);
+    return ((PFN)VS(w->base.pReal,0x88))(w->base.pReal,p);
+}
+
+/* SC1 helpers : délègue à pReal1, retourne E_NOTIMPL si NULL */
+#define SC1_CALL_0(off) do { \
+    if (!w->pReal1) return E_NOTIMPL; \
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*); \
+    return ((PFN)VS(w->pReal1,(off)))(w->pReal1); } while(0)
+/* typeof() est une extension GCC non dispo en -std=c11.
+ * On utilise void* : sûr en x64 ms_abi pour tous les pointeurs. */
+#define SC1_CALL_1(off,a) do { \
+    if (!w->pReal1) return E_NOTIMPL; \
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*, void*); \
+    return ((PFN)VS(w->pReal1,(off)))(w->pReal1, (void*)(a)); } while(0)
+
+/* IDXGISwapChain1 (offsets commencent à 0x90 = après IDXGISwapChain 10 méthodes×8+base) */
+static HRESULT STDMETHODCALLTYPE SC_GetDesc1(WrapSC*w,void*p)           { SC1_CALL_1(0x90,p); }
+static HRESULT STDMETHODCALLTYPE SC_GetFullscreenDesc(WrapSC*w,void*p)  { SC1_CALL_1(0x98,p); }
+static HRESULT STDMETHODCALLTYPE SC_GetHwnd(WrapSC*w,HWND*p)
+{
+    if(!w->pReal1) return E_NOTIMPL;
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,HWND*);
+    LOG("IDXGISwapChain1::GetHwnd");
+    HRESULT hr=((PFN)VS(w->pReal1,0xa0))(w->pReal1,p);
+    LOG_LEAVE("IDXGISwapChain1::GetHwnd",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE SC_GetCoreWindow(WrapSC*w,REFIID r,void**pp)
+{
+    if(!w->pReal1||!pp) return E_NOTIMPL; *pp=NULL;
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,REFIID,void**);
+    return ((PFN)VS(w->pReal1,0xa8))(w->pReal1,r,pp);
+}
+static HRESULT STDMETHODCALLTYPE SC_Present1(WrapSC*w,UINT si,UINT fl,const void*p)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT,UINT,const void*);
+    HRESULT hr;
+    LOG("IDXGISwapChain1::Present1(sync=%u,flags=0x%X)",si,fl);
+    if(w->interop) { D3D12Interop_Present(w,si,fl,&hr); LOG_LEAVE("IDXGISwapChain1::Present1[interop]",hr); return hr; }
+    if(!w->pReal1) {
+        /* Fallback vers Present (ignore les paramètres Present1) */
+        return SC_Present(w,si,fl);
+    }
+    hr=((PFN)VS(w->pReal1,0xb0))(w->pReal1,si,fl,p);
+    LOG_LEAVE("IDXGISwapChain1::Present1",hr); return hr;
+}
+static BOOL    STDMETHODCALLTYPE SC_IsTemporaryMonoSupported(WrapSC*w)
+{
+    if(!w->pReal1) return FALSE;
+    typedef BOOL(STDMETHODCALLTYPE*PFN)(void*);
+    return ((PFN)VS(w->pReal1,0xb8))(w->pReal1);
+}
+static HRESULT STDMETHODCALLTYPE SC_GetRestrictToOutput(WrapSC*w,void**pp)
+{
+    if(!w->pReal1||!pp) return E_NOTIMPL; *pp=NULL;
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,void**);
+    return ((PFN)VS(w->pReal1,0xc0))(w->pReal1,pp);
+}
+static HRESULT STDMETHODCALLTYPE SC_SetBackgroundColor(WrapSC*w,const void*p) { SC1_CALL_1(0xc8,p); }
+static HRESULT STDMETHODCALLTYPE SC_GetBackgroundColor(WrapSC*w,void*p)       { SC1_CALL_1(0xd0,p); }
+static HRESULT STDMETHODCALLTYPE SC_SetRotation(WrapSC*w,UINT r)
+{
+    if(!w->pReal1) return E_NOTIMPL;
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT);
+    return ((PFN)VS(w->pReal1,0xd8))(w->pReal1,r);
+}
+static HRESULT STDMETHODCALLTYPE SC_GetRotation(WrapSC*w,UINT*r)
+{
+    if(!w->pReal1||!r) return E_NOTIMPL;
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT*);
+    return ((PFN)VS(w->pReal1,0xe0))(w->pReal1,r);
+}
+
+/* SC2 stubs (Win8.1+) */
+#define SC2_STUB(nm) static HRESULT STDMETHODCALLTYPE SC_##nm(WrapSC*w,...) \
+    { LOG("IDXGISwapChain2::" #nm " (stub)"); (void)w; return w->pReal2 ? E_NOTIMPL : DXGI_ERROR_UNSUPPORTED; }
+
+static HRESULT STDMETHODCALLTYPE SC_SetSourceSize(WrapSC*w,UINT W,UINT H)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT,UINT);
+    LOG("IDXGISwapChain2::SetSourceSize(%u,%u)",W,H);
+    if(!w->pReal2) return DXGI_ERROR_UNSUPPORTED;
+    HRESULT hr=((PFN)VS(w->pReal2,0xe8))(w->pReal2,W,H);
+    LOG_LEAVE("IDXGISwapChain2::SetSourceSize",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE SC_GetSourceSize(WrapSC*w,UINT*pW,UINT*pH)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT*,UINT*);
+    if(!w->pReal2) return DXGI_ERROR_UNSUPPORTED;
+    return ((PFN)VS(w->pReal2,0xf0))(w->pReal2,pW,pH);
+}
+static HRESULT STDMETHODCALLTYPE SC_SetMaximumFrameLatency(WrapSC*w,UINT ml)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT);
+    if(!w->pReal2) return DXGI_ERROR_UNSUPPORTED;
+    return ((PFN)VS(w->pReal2,0xf8))(w->pReal2,ml);
+}
+static HRESULT STDMETHODCALLTYPE SC_GetMaximumFrameLatency(WrapSC*w,UINT*p)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT*);
+    if(!w->pReal2||!p) return DXGI_ERROR_UNSUPPORTED;
+    return ((PFN)VS(w->pReal2,0x100))(w->pReal2,p);
+}
+static HANDLE STDMETHODCALLTYPE SC_GetFrameLatencyWaitableObject(WrapSC*w)
+{
+    typedef HANDLE(STDMETHODCALLTYPE*PFN)(void*);
+    LOG("IDXGISwapChain2::GetFrameLatencyWaitableObject");
+    if(!w->pReal2) return NULL;
+    return ((PFN)VS(w->pReal2,0x108))(w->pReal2);
+}
+static HRESULT STDMETHODCALLTYPE SC_SetMatrixTransform(WrapSC*w,const void*m)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,const void*);
+    if(!w->pReal2) return DXGI_ERROR_UNSUPPORTED;
+    return ((PFN)VS(w->pReal2,0x110))(w->pReal2,m);
+}
+static HRESULT STDMETHODCALLTYPE SC_GetMatrixTransform(WrapSC*w,void*m)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,void*);
+    if(!w->pReal2) return DXGI_ERROR_UNSUPPORTED;
+    return ((PFN)VS(w->pReal2,0x118))(w->pReal2,m);
+}
+
+/* SC3 (Win10) */
+static UINT STDMETHODCALLTYPE SC_GetCurrentBackBufferIndex(WrapSC*w)
+{
+    typedef UINT(STDMETHODCALLTYPE*PFN)(void*);
+    LOG("IDXGISwapChain3::GetCurrentBackBufferIndex");
+    if(w->interop) {
+        UINT idx = w->interop->presentIndex % w->interop->BufferCount;
+        LOG("  [interop] GetCurrentBackBufferIndex -> %u",idx);
+        return idx;
+    }
+    if(!w->pReal3) return 0;
+    return ((PFN)VS(w->pReal3,0x120))(w->pReal3);
+}
+static HRESULT STDMETHODCALLTYPE SC_CheckColorSpaceSupport(WrapSC*w,UINT cs,UINT*pFlags)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT,UINT*);
+    LOG("IDXGISwapChain3::CheckColorSpaceSupport(%u)",cs);
+    if(!w->pReal3||!pFlags) return E_NOTIMPL;
+    return ((PFN)VS(w->pReal3,0x128))(w->pReal3,cs,pFlags);
+}
+static HRESULT STDMETHODCALLTYPE SC_SetColorSpace1(WrapSC*w,UINT cs)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT);
+    LOG("IDXGISwapChain3::SetColorSpace1(%u)",cs);
+    if(!w->pReal3) return DXGI_ERROR_UNSUPPORTED;
+    return ((PFN)VS(w->pReal3,0x130))(w->pReal3,cs);
+}
+static HRESULT STDMETHODCALLTYPE SC_ResizeBuffers1(WrapSC*w,UINT bc,UINT W,UINT H,UINT F,UINT Fl,const UINT*pND,IUnknown*const*ppQueues)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT,UINT,UINT,UINT,UINT,const UINT*,IUnknown*const*);
+    LOG("IDXGISwapChain3::ResizeBuffers1(%u,%u,%u)",bc,W,H);
+    if(!w->pReal3) {
+        /* Fallback vers ResizeBuffers si SC3 indisponible */
+        return SC_ResizeBuffers(w,bc,W,H,F,Fl);
+    }
+    return ((PFN)VS(w->pReal3,0x138))(w->pReal3,bc,W,H,F,Fl,pND,ppQueues);
+}
+
+/* SC4 (Win10 RS2+) */
+static HRESULT STDMETHODCALLTYPE SC_SetHDRMetaData(WrapSC*w,UINT t,UINT sz,void*p)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT,UINT,void*);
+    LOG("IDXGISwapChain4::SetHDRMetaData(type=%u,sz=%u)",t,sz);
+    if(!w->pReal4) return DXGI_ERROR_UNSUPPORTED;
+    return ((PFN)VS(w->pReal4,0x140))(w->pReal4,t,sz,p);
+}
+
+/* =========================================================
+ * ======== ADAPTER WRAPPER ========
+ * Expose IDXGIAdapter..IDXGIAdapter4
+ * ========================================================= */
+typedef struct _WrapAdapter {
+    DXGIBASE base;
+    void *pReal1, *pReal2, *pReal3, *pReal4;
+} WrapAdapter;
+
+static HRESULT STDMETHODCALLTYPE WA_QI(WrapAdapter*,REFIID,void**);
+static ULONG   STDMETHODCALLTYPE WA_AddRef(WrapAdapter*);
+static ULONG   STDMETHODCALLTYPE WA_Release(WrapAdapter*);
+
+static void WA_Dtor(DXGIBASE *b)
+{
+    WrapAdapter *w=(WrapAdapter*)b;
+    if(w->pReal4){((IUnknown*)w->pReal4)->lpVtbl->Release((IUnknown*)w->pReal4);w->pReal4=NULL;}
+    if(w->pReal3){((IUnknown*)w->pReal3)->lpVtbl->Release((IUnknown*)w->pReal3);w->pReal3=NULL;}
+    if(w->pReal2){((IUnknown*)w->pReal2)->lpVtbl->Release((IUnknown*)w->pReal2);w->pReal2=NULL;}
+    if(w->pReal1){((IUnknown*)w->pReal1)->lpVtbl->Release((IUnknown*)w->pReal1);w->pReal1=NULL;}
+}
+
+/* Vtable Adapter (prototype séquentiel complet) */
+static HRESULT STDMETHODCALLTYPE WA_SetPriv(WrapAdapter*w,REFGUID g,UINT sz,const void*p)
+{ return PrivData_Set(&w->base.pPriv,&w->base.csPriv,g,sz,p); }
+static HRESULT STDMETHODCALLTYPE WA_SetPrivUnk(WrapAdapter*w,REFGUID g,const IUnknown*p)
+{ return PrivData_SetUnk(&w->base.pPriv,&w->base.csPriv,g,p); }
+static HRESULT STDMETHODCALLTYPE WA_GetPriv(WrapAdapter*w,REFGUID g,UINT*sz,void*p)
+{ return PrivData_Get(&w->base.pPriv,&w->base.csPriv,g,sz,p); }
+static HRESULT STDMETHODCALLTYPE WA_GetParent(WrapAdapter*w,REFIID r,void**pp)
+{
+    /* Le parent d'un Adapter est la Factory — on retourne notre wrapper */
+    LOG("IDXGIAdapter::GetParent(%s)",GuidName(r));
+    if (!pp) return E_INVALIDARG; *pp=NULL;
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,REFIID,void**);
+    void *pRealParent=NULL;
+    HRESULT hr=((PFN)VS(w->base.pReal,0x30))(w->base.pReal,r,&pRealParent);
+    if(SUCCEEDED(hr) && pRealParent) {
+        hr = WrapFactory_Create((IUnknown*)pRealParent,0,r,pp);
+        ((IUnknown*)pRealParent)->lpVtbl->Release((IUnknown*)pRealParent);
+    }
+    LOG_LEAVE("IDXGIAdapter::GetParent",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE WA_EnumOutputs(WrapAdapter*w,UINT i,void**pp)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT,void**);
+    LOG("IDXGIAdapter::EnumOutputs(%u)",i);
+    if(!pp) return E_INVALIDARG; *pp=NULL;
+    /* Délègue direct ; on ne wrappe pas IDXGIOutput pour l'instant (délégation transparente) */
+    HRESULT hr=((PFN)VS(w->base.pReal,0x38))(w->base.pReal,i,pp);
+    LOG_LEAVE("IDXGIAdapter::EnumOutputs",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE WA_GetDesc(WrapAdapter*w,void*p)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,void*);
+    LOG("IDXGIAdapter::GetDesc");
+    HRESULT hr=((PFN)VS(w->base.pReal,0x40))(w->base.pReal,p);
+    LOG_LEAVE("IDXGIAdapter::GetDesc",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE WA_CheckInterfaceSupport(WrapAdapter*w,REFGUID n,void*p)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,REFGUID,void*);
+    LOG("IDXGIAdapter::CheckInterfaceSupport(%s)",GuidName(n));
+    HRESULT hr=((PFN)VS(w->base.pReal,0x48))(w->base.pReal,n,p);
+    LOG_LEAVE("IDXGIAdapter::CheckInterfaceSupport",hr); return hr;
+}
+/* Adapter1 */
+static HRESULT STDMETHODCALLTYPE WA_GetDesc1(WrapAdapter*w,void*p)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,void*);
+    LOG("IDXGIAdapter1::GetDesc1");
+    if(!w->pReal1) return E_NOTIMPL;
+    HRESULT hr=((PFN)VS(w->pReal1,0x50))(w->pReal1,p);
+    LOG_LEAVE("IDXGIAdapter1::GetDesc1",hr); return hr;
+}
+/* Adapter2 */
+static HRESULT STDMETHODCALLTYPE WA_GetDesc2(WrapAdapter*w,void*p)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,void*);
+    LOG("IDXGIAdapter2::GetDesc2");
+    if(!w->pReal2) return DXGI_ERROR_UNSUPPORTED;
+    HRESULT hr=((PFN)VS(w->pReal2,0x58))(w->pReal2,p);
+    LOG_LEAVE("IDXGIAdapter2::GetDesc2",hr); return hr;
+}
+/* Adapter3 — RegisterHardwareContentProtectionTeardownStatusEvent etc. stubs */
+static HRESULT STDMETHODCALLTYPE WA_RegisterVideoMemoryBudgetChangeNotification(WrapAdapter*w,HANDLE h,DWORD*p)
+{
+    LOG("IDXGIAdapter3::RegisterVideoMemoryBudgetChangeNotification (stub)");
+    if(!w->pReal3) return DXGI_ERROR_UNSUPPORTED;
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,HANDLE,DWORD*);
+    return ((PFN)VS(w->pReal3,0x60))(w->pReal3,h,p);
+}
+static void STDMETHODCALLTYPE WA_UnregisterVideoMemoryBudgetChangeNotification(WrapAdapter*w,DWORD c)
+{
+    LOG("IDXGIAdapter3::UnregisterVideoMemoryBudgetChangeNotification (stub)");
+    if(!w->pReal3) return;
+    typedef void(STDMETHODCALLTYPE*PFN)(void*,DWORD);
+    ((PFN)VS(w->pReal3,0x68))(w->pReal3,c);
+}
+static HRESULT STDMETHODCALLTYPE WA_QueryVideoMemoryInfo(WrapAdapter*w,UINT node,UINT sg,void*p)
+{
+    LOG("IDXGIAdapter3::QueryVideoMemoryInfo(node=%u,seg=%u)",node,sg);
+    if(!w->pReal3) {
+        /* Fallback Win7 : on utilise D3DKMTQueryVideoMemoryInfo si disponible */
+        typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT,UINT,void*);
+        HRESULT (*pfn)(void*,UINT,UINT,void*) = NULL;
+        HMODULE hGdi = GetModuleHandleA("gdi32.dll");
+        if(hGdi) *(FARPROC*)&pfn = GetProcAddress(hGdi,"D3DKMTQueryVideoMemoryInfo");
+        if(pfn) return pfn(w->base.pReal,node,sg,p);
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT,UINT,void*);
+    return ((PFN)VS(w->pReal3,0x70))(w->pReal3,node,sg,p);
+}
+static HRESULT STDMETHODCALLTYPE WA_SetVideoMemoryReservation(WrapAdapter*w,UINT node,UINT sg,UINT64 r)
+{
+    LOG("IDXGIAdapter3::SetVideoMemoryReservation(node=%u,seg=%u,res=%llu)",node,sg,(unsigned long long)r);
+    if(!w->pReal3) return DXGI_ERROR_UNSUPPORTED;
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT,UINT,UINT64);
+    return ((PFN)VS(w->pReal3,0x78))(w->pReal3,node,sg,r);
+}
+/* Adapter4 */
+static HRESULT STDMETHODCALLTYPE WA_GetDesc3(WrapAdapter*w,void*p)
+{
+    LOG("IDXGIAdapter4::GetDesc3");
+    if(!w->pReal4) return DXGI_ERROR_UNSUPPORTED;
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,void*);
+    return ((PFN)VS(w->pReal4,0x80))(w->pReal4,p);
+}
+
+static const void* g_WA_Vtbl[] = {
+    WA_QI, WA_AddRef, WA_Release,
+    WA_SetPriv, WA_SetPrivUnk, WA_GetPriv, WA_GetParent,
+    WA_EnumOutputs, WA_GetDesc, WA_CheckInterfaceSupport, /* IDXGIAdapter */
+    WA_GetDesc1,     /* IDXGIAdapter1 */
+    WA_GetDesc2,     /* IDXGIAdapter2 */
+    WA_RegisterVideoMemoryBudgetChangeNotification,
+    WA_UnregisterVideoMemoryBudgetChangeNotification,
+    WA_QueryVideoMemoryInfo,
+    WA_SetVideoMemoryReservation, /* IDXGIAdapter3 */
+    WA_GetDesc3,     /* IDXGIAdapter4 */
+};
+
+static HRESULT STDMETHODCALLTYPE WA_QI(WrapAdapter *w, REFIID riid, void **ppv)
+{
+    LOG("IDXGIAdapter::QI(%s)",GuidName(riid));
+    if(!ppv) return E_INVALIDARG; *ppv=NULL;
+    if(GuidEq(riid,&IID_IUnknown_)||GuidEq(riid,&IID_IDXGIObject)||GuidEq(riid,&IID_IDXGIAdapter))
+        { *ppv=w; WA_AddRef(w); return S_OK; }
+    if(GuidEq(riid,&IID_IDXGIAdapter1)&&w->pReal1){ *ppv=w; WA_AddRef(w); return S_OK; }
+    if(GuidEq(riid,&IID_IDXGIAdapter2)&&w->pReal2){ *ppv=w; WA_AddRef(w); return S_OK; }
+    if(GuidEq(riid,&IID_IDXGIAdapter3)&&w->pReal3){ *ppv=w; WA_AddRef(w); return S_OK; }
+    if(GuidEq(riid,&IID_IDXGIAdapter4)&&w->pReal4){ *ppv=w; WA_AddRef(w); return S_OK; }
+    /*
+     * GUID inconnu : logguer l'hex exact pour identification, puis déléguer.
+     *
+     * CAUSE DU CRASH : d3d11.dll demande des interfaces internes privées
+     * (non-documentées) à l'adapter immédiatement après GetDesc1.
+     * Si on retourne E_NOINTERFACE sans déléguer, d3d11 déréférence
+     * *ppv == NULL → EXCEPTION_ACCESS_VIOLATION à 0x0.
+     *
+     * SOLUTION : déléguer à l'adapter réel. Il connaît ses propres
+     * interfaces internes et les retourne correctement. L'objet retourné
+     * est l'interface native (pas wrappée), ce qui est correct car ces
+     * interfaces ne sont pas exposées aux applications — uniquement à
+     * d3d11.dll / nvapi.dll / amdxc64.dll qui savent les utiliser.
+     */
+    LOG("IDXGIAdapter::QI unknown GUID {%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X} → passthrough",
+        riid->Data1, riid->Data2, riid->Data3,
+        riid->Data4[0], riid->Data4[1],
+        riid->Data4[2], riid->Data4[3], riid->Data4[4],
+        riid->Data4[5], riid->Data4[6], riid->Data4[7]);
+    return w->base.pReal->lpVtbl->QueryInterface(w->base.pReal, riid, ppv);
+}
+static ULONG STDMETHODCALLTYPE WA_AddRef (WrapAdapter*w){ return Base_AddRef(&w->base); }
+static ULONG STDMETHODCALLTYPE WA_Release(WrapAdapter*w){ return Base_Release(&w->base,WA_Dtor); }
+
+static HRESULT WrapAdapter_Create(IUnknown *pReal, REFIID riid, void **ppOut)
+{
+    WrapAdapter *w; HRESULT hr;
+    LOG("WrapAdapter_Create riid=%s",GuidName(riid));
+    if(!ppOut) return E_INVALIDARG; *ppOut=NULL;
+    if(!pReal) return E_INVALIDARG;
+    w = HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,sizeof(*w));
+    if(!w) return E_OUTOFMEMORY;
+    /* AddRef explicite : Base_Init prend ownership de cette ref.
+     * Le caller conserve la sienne (qu'il libérera lui-même). */
+    pReal->lpVtbl->AddRef(pReal);
+    Base_Init(&w->base,(void*)g_WA_Vtbl,pReal);
+    pReal->lpVtbl->QueryInterface(pReal,&IID_IDXGIAdapter1,&w->pReal1);
+    pReal->lpVtbl->QueryInterface(pReal,&IID_IDXGIAdapter2,&w->pReal2);
+    pReal->lpVtbl->QueryInterface(pReal,&IID_IDXGIAdapter3,&w->pReal3);
+    pReal->lpVtbl->QueryInterface(pReal,&IID_IDXGIAdapter4,&w->pReal4);
+    hr = WA_QI(w,riid,ppOut);
+    WA_Release(w); /* retire la ref de création du wrapper (lRef 1→0 si QI a échoué) */
+    return hr;
+}
+
+/* =========================================================
+ * ======== FACTORY WRAPPER ========
+ * IDXGIFactory..IDXGIFactory7 — objet principal
+ * ========================================================= */
+typedef struct _WrapFactory {
+    DXGIBASE base;
+    void *pRealF;   /* IDXGIFactory*  */
+    void *pRealF1;  /* IDXGIFactory1* */
+    void *pRealF2;  /* IDXGIFactory2* ou NULL */
+    UINT  uFlags;   /* création flags */
+    /* Enregistrement de changement d'adaptateur (Factory7, stub) */
+    DWORD dwAdapChgCookie;
+} WrapFactory;
+
+/* -------- forward decls -------- */
+static HRESULT STDMETHODCALLTYPE WF_QI      (WrapFactory*,REFIID,void**);
+static ULONG   STDMETHODCALLTYPE WF_AddRef  (WrapFactory*);
+static ULONG   STDMETHODCALLTYPE WF_Release (WrapFactory*);
+static HRESULT STDMETHODCALLTYPE WF_SetPriv (WrapFactory*,REFGUID,UINT,const void*);
+static HRESULT STDMETHODCALLTYPE WF_SetPrivUnk(WrapFactory*,REFGUID,const IUnknown*);
+static HRESULT STDMETHODCALLTYPE WF_GetPriv (WrapFactory*,REFGUID,UINT*,void*);
+static HRESULT STDMETHODCALLTYPE WF_GetParent(WrapFactory*,REFIID,void**);
+static HRESULT STDMETHODCALLTYPE WF_EnumAdapters(WrapFactory*,UINT,void**);
+static HRESULT STDMETHODCALLTYPE WF_MakeWindowAssociation(WrapFactory*,HWND,UINT);
+static HRESULT STDMETHODCALLTYPE WF_GetWindowAssociation(WrapFactory*,HWND*);
+static HRESULT STDMETHODCALLTYPE WF_CreateSwapChain(WrapFactory*,IUnknown*,void*,void**);
+static HRESULT STDMETHODCALLTYPE WF_CreateSoftwareAdapter(WrapFactory*,HMODULE,void**);
+static HRESULT STDMETHODCALLTYPE WF_EnumAdapters1(WrapFactory*,UINT,void**);
+static BOOL    STDMETHODCALLTYPE WF_IsCurrent(WrapFactory*);
+static BOOL    STDMETHODCALLTYPE WF_IsWindowedStereoEnabled(WrapFactory*);
+static HRESULT STDMETHODCALLTYPE WF_CreateSwapChainForHwnd(WrapFactory*,IUnknown*,HWND,const void*,const void*,void*,void**);
+static HRESULT STDMETHODCALLTYPE WF_CreateSwapChainForCoreWindow(WrapFactory*,IUnknown*,IUnknown*,const void*,void*,void**);
+static HRESULT STDMETHODCALLTYPE WF_GetSharedResourceAdapterLuid(WrapFactory*,HANDLE,LUID*);
+static HRESULT STDMETHODCALLTYPE WF_RegisterStereoStatusWindow(WrapFactory*,HWND,UINT,DWORD*);
+static HRESULT STDMETHODCALLTYPE WF_RegisterStereoStatusEvent(WrapFactory*,HANDLE,DWORD*);
+static void    STDMETHODCALLTYPE WF_UnregisterStereoStatus(WrapFactory*,DWORD);
+static HRESULT STDMETHODCALLTYPE WF_RegisterOcclusionStatusWindow(WrapFactory*,HWND,UINT,DWORD*);
+static HRESULT STDMETHODCALLTYPE WF_RegisterOcclusionStatusEvent(WrapFactory*,HANDLE,DWORD*);
+static void    STDMETHODCALLTYPE WF_UnregisterOcclusionStatus(WrapFactory*,DWORD);
+static HRESULT STDMETHODCALLTYPE WF_CreateSwapChainForComposition(WrapFactory*,IUnknown*,const void*,void*,void**);
+static UINT    STDMETHODCALLTYPE WF_GetCreationFlags(WrapFactory*);
+static HRESULT STDMETHODCALLTYPE WF_EnumAdapterByLuid(WrapFactory*,LUID,REFIID,void**);
+static HRESULT STDMETHODCALLTYPE WF_EnumWarpAdapter(WrapFactory*,REFIID,void**);
+static HRESULT STDMETHODCALLTYPE WF_CheckFeatureSupport(WrapFactory*,UINT,void*,UINT);
+static HRESULT STDMETHODCALLTYPE WF_EnumAdapterByGpuPreference(WrapFactory*,UINT,UINT,REFIID,void**);
+static HRESULT STDMETHODCALLTYPE WF_RegisterAdaptersChangedEvent(WrapFactory*,HANDLE,DWORD*);
+static HRESULT STDMETHODCALLTYPE WF_UnregisterAdaptersChangedEvent(WrapFactory*,DWORD);
+
+static const void* g_WF_Vtbl[] = {
+    WF_QI, WF_AddRef, WF_Release,
+    WF_SetPriv, WF_SetPrivUnk, WF_GetPriv, WF_GetParent,
+    WF_EnumAdapters, WF_MakeWindowAssociation, WF_GetWindowAssociation,
+    WF_CreateSwapChain, WF_CreateSoftwareAdapter,   /* IDXGIFactory */
+    WF_EnumAdapters1, WF_IsCurrent,                 /* IDXGIFactory1 */
+    WF_IsWindowedStereoEnabled,
+    WF_CreateSwapChainForHwnd, WF_CreateSwapChainForCoreWindow,
+    WF_GetSharedResourceAdapterLuid,
+    WF_RegisterStereoStatusWindow, WF_RegisterStereoStatusEvent, WF_UnregisterStereoStatus,
+    WF_RegisterOcclusionStatusWindow, WF_RegisterOcclusionStatusEvent, WF_UnregisterOcclusionStatus,
+    WF_CreateSwapChainForComposition,               /* IDXGIFactory2 */
+    WF_GetCreationFlags,                             /* IDXGIFactory3 */
+    WF_EnumAdapterByLuid, WF_EnumWarpAdapter,        /* IDXGIFactory4 */
+    WF_CheckFeatureSupport,                          /* IDXGIFactory5 */
+    WF_EnumAdapterByGpuPreference,                   /* IDXGIFactory6 */
+    WF_RegisterAdaptersChangedEvent,
+    WF_UnregisterAdaptersChangedEvent,               /* IDXGIFactory7 */
+};
+
+static void WF_Dtor(DXGIBASE *b)
+{
+    WrapFactory *w=(WrapFactory*)b;
+    if(w->pRealF2){((IUnknown*)w->pRealF2)->lpVtbl->Release((IUnknown*)w->pRealF2);w->pRealF2=NULL;}
+    if(w->pRealF1){((IUnknown*)w->pRealF1)->lpVtbl->Release((IUnknown*)w->pRealF1);w->pRealF1=NULL;}
+    /* pRealF = base.pReal, libéré par Base_Dtor */
+    InterlockedCompareExchangePointer(&g_pActiveFactory, NULL, w);
+}
+
+static HRESULT WrapFactory_Create(IUnknown *pReal, UINT uFlags, REFIID riid, void **ppOut)
+{
+    WrapFactory *w; HRESULT hr;
+    LOG("WrapFactory_Create flags=0x%X pReal=%p", uFlags, (void*)pReal);
+    LOG_GUID("WrapFactory_Create",riid);
+    if(!ppOut) return E_INVALIDARG; *ppOut=NULL;
+    if(!pReal) return E_INVALIDARG;
+
+    w = HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,sizeof(*w));
+    if(!w) return E_OUTOFMEMORY;
+
+    /* QI pour le niveau le plus haut disponible */
+    void *pF=NULL, *pF1=NULL, *pF2=NULL;
+    HRESULT hrF =pReal->lpVtbl->QueryInterface(pReal,&IID_IDXGIFactory, &pF);
+    HRESULT hrF1=pReal->lpVtbl->QueryInterface(pReal,&IID_IDXGIFactory1,&pF1);
+    HRESULT hrF2=pReal->lpVtbl->QueryInterface(pReal,&IID_IDXGIFactory2,&pF2);
+    LOG("WrapFactory_Create: QI(IDXGIFactory)=0x%08X pF=%p | QI(IDXGIFactory1)=0x%08X pF1=%p | QI(IDXGIFactory2)=0x%08X pF2=%p",
+        (unsigned)hrF,pF,(unsigned)hrF1,pF1,(unsigned)hrF2,pF2);
+
+    if(!pF) {
+        LOG("WrapFactory_Create: pF==NULL -> E_NOINTERFACE (pReal ne supporte pas IDXGIFactory de base !)");
+        if(pF1) ((IUnknown*)pF1)->lpVtbl->Release((IUnknown*)pF1);
+        if(pF2) ((IUnknown*)pF2)->lpVtbl->Release((IUnknown*)pF2);
+        HeapFree(GetProcessHeap(),0,w);
+        return E_NOINTERFACE;
+    }
+
+    Base_Init(&w->base,(void*)g_WF_Vtbl,(IUnknown*)pF);
+    w->pRealF  = pF;
+    w->pRealF1 = pF1;
+    w->pRealF2 = pF2;
+    w->uFlags  = uFlags;
+
+    /* Stocker la factory active pour UpdateHMD */
+    InterlockedExchangePointer(&g_pActiveFactory, w);
+
+    LOG("WrapFactory_Create: --> WF_QI (riid demandé par l'appelant)");
+    hr = WF_QI(w, riid, ppOut);
+    LOG("WrapFactory_Create: <-- WF_QI = 0x%08X *ppOut=%p",(unsigned)hr,*ppOut);
+    WF_Release(w); /* retire la ref de création */
+    LOG_LEAVE("WrapFactory_Create", hr);
+    return hr;
+}
+
+/* --- IUnknown --- */
+static HRESULT STDMETHODCALLTYPE WF_QI(WrapFactory *w, REFIID riid, void **ppv)
+{
+    LOG_GUID("IDXGIFactory::QI",riid);
+    if(!ppv) return E_INVALIDARG; *ppv=NULL;
+    BOOL ok =
+        GuidEq(riid,&IID_IUnknown_)    || GuidEq(riid,&IID_IDXGIObject)   ||
+        GuidEq(riid,&IID_IDXGIFactory) || GuidEq(riid,&IID_IDXGIFactory1) ||
+        GuidEq(riid,&IID_IDXGIFactory2)|| GuidEq(riid,&IID_IDXGIFactory3) ||
+        GuidEq(riid,&IID_IDXGIFactory4)|| GuidEq(riid,&IID_IDXGIFactory5) ||
+        GuidEq(riid,&IID_IDXGIFactory6)|| GuidEq(riid,&IID_IDXGIFactory7);
+    if(ok){ *ppv=w; WF_AddRef(w); return S_OK; }
+    /* GUID inconnu : déléguer au real pour les interfaces internes */
+    LOG_GUID("IDXGIFactory::QI unknown -> passthrough vers pReal",riid);
+    HRESULT hrp = w->base.pReal->lpVtbl->QueryInterface(w->base.pReal, riid, ppv);
+    LOG("IDXGIFactory::QI passthrough = 0x%08X *ppv=%p",(unsigned)hrp,*ppv);
+    return hrp;
+}
+static ULONG STDMETHODCALLTYPE WF_AddRef (WrapFactory*w){ return Base_AddRef(&w->base); }
+static ULONG STDMETHODCALLTYPE WF_Release(WrapFactory*w){ return Base_Release(&w->base,WF_Dtor); }
+
+/* --- IDXGIObject --- */
+static HRESULT STDMETHODCALLTYPE WF_SetPriv(WrapFactory*w,REFGUID g,UINT sz,const void*p)
+{ return PrivData_Set(&w->base.pPriv,&w->base.csPriv,g,sz,p); }
+static HRESULT STDMETHODCALLTYPE WF_SetPrivUnk(WrapFactory*w,REFGUID g,const IUnknown*p)
+{ return PrivData_SetUnk(&w->base.pPriv,&w->base.csPriv,g,p); }
+static HRESULT STDMETHODCALLTYPE WF_GetPriv(WrapFactory*w,REFGUID g,UINT*sz,void*p)
+{ return PrivData_Get(&w->base.pPriv,&w->base.csPriv,g,sz,p); }
+static HRESULT STDMETHODCALLTYPE WF_GetParent(WrapFactory*w,REFIID r,void**pp)
+{
+    /* Factory n'a pas de parent → E_NOINTERFACE (comportement identique Win10) */
+    (void)w; (void)r;
+    LOG("IDXGIFactory::GetParent → E_NOINTERFACE (no parent)");
+    if(pp) *pp=NULL;
+    return E_NOINTERFACE;
+}
+
+/* --- IDXGIFactory --- */
+static HRESULT STDMETHODCALLTYPE WF_EnumAdapters(WrapFactory*w,UINT i,void**pp)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT,void**);
+    LOG("IDXGIFactory::EnumAdapters(%u)",i);
+    if(!pp) return E_INVALIDARG; *pp=NULL;
+    void *pA=NULL;
+    HRESULT hr=((PFN)VS(w->pRealF,0x38))(w->pRealF,i,&pA);
+    if(SUCCEEDED(hr)) hr=WrapAdapter_Create((IUnknown*)pA,&IID_IDXGIAdapter,pp);
+    if(pA) { ((IUnknown*)pA)->lpVtbl->Release((IUnknown*)pA); pA=NULL; }
+    LOG_LEAVE("IDXGIFactory::EnumAdapters",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE WF_MakeWindowAssociation(WrapFactory*w,HWND h,UINT f)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,HWND,UINT);
+    LOG("IDXGIFactory::MakeWindowAssociation(hwnd=%p,flags=0x%X)",(void*)h,f);
+    HRESULT hr=((PFN)VS(w->pRealF,0x40))(w->pRealF,h,f);
+    LOG_LEAVE("IDXGIFactory::MakeWindowAssociation",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE WF_GetWindowAssociation(WrapFactory*w,HWND*ph)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,HWND*);
+    LOG("IDXGIFactory::GetWindowAssociation");
+    if(!ph) return E_INVALIDARG;
+    HRESULT hr=((PFN)VS(w->pRealF,0x48))(w->pRealF,ph);
+    LOG_LEAVE("IDXGIFactory::GetWindowAssociation",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE WF_CreateSwapChain(WrapFactory*w,IUnknown*pDev,void*pDesc,void**pp)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,IUnknown*,void*,void**);
+    LOG("IDXGIFactory::CreateSwapChain");
+    if(!pp) return E_INVALIDARG; *pp=NULL;
+    void *pSC=NULL;
+    HRESULT hr=((PFN)VS(w->pRealF,0x50))(w->pRealF,pDev,pDesc,&pSC);
+    if(SUCCEEDED(hr)) hr=WrapSC_Create((IUnknown*)pSC,&IID_IDXGISwapChain,pp);
+    if(pSC) { ((IUnknown*)pSC)->lpVtbl->Release((IUnknown*)pSC); pSC=NULL; }
+    LOG_LEAVE("IDXGIFactory::CreateSwapChain",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE WF_CreateSoftwareAdapter(WrapFactory*w,HMODULE hm,void**pp)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,HMODULE,void**);
+    LOG("IDXGIFactory::CreateSoftwareAdapter");
+    if(!pp) return E_INVALIDARG; *pp=NULL;
+    void *pA=NULL;
+    HRESULT hr=((PFN)VS(w->pRealF,0x58))(w->pRealF,hm,&pA);
+    if(SUCCEEDED(hr)) hr=WrapAdapter_Create((IUnknown*)pA,&IID_IDXGIAdapter,pp);
+    if(pA) { ((IUnknown*)pA)->lpVtbl->Release((IUnknown*)pA); pA=NULL; }
+    LOG_LEAVE("IDXGIFactory::CreateSoftwareAdapter",hr); return hr;
+}
+
+/* --- IDXGIFactory1 --- */
+static HRESULT STDMETHODCALLTYPE WF_EnumAdapters1(WrapFactory*w,UINT i,void**pp)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT,void**);
+    LOG("IDXGIFactory1::EnumAdapters1(%u)",i);
+    if(!pp) return E_INVALIDARG; *pp=NULL;
+    void *pSrc = w->pRealF1 ? w->pRealF1 : w->pRealF;
+    UINT off   = w->pRealF1 ? 0x60 : 0x38; /* Factory1::EnumAdapters1 ou Factory::EnumAdapters */
+    void *pA=NULL;
+    HRESULT hr=((PFN)VS(pSrc,off))(pSrc,i,&pA);
+    if(SUCCEEDED(hr)) hr=WrapAdapter_Create((IUnknown*)pA,&IID_IDXGIAdapter1,pp);
+    if(pA) { ((IUnknown*)pA)->lpVtbl->Release((IUnknown*)pA); pA=NULL; }
+    LOG_LEAVE("IDXGIFactory1::EnumAdapters1",hr); return hr;
+}
+static BOOL STDMETHODCALLTYPE WF_IsCurrent(WrapFactory*w)
+{
+    typedef BOOL(STDMETHODCALLTYPE*PFN)(void*);
+    BOOL b = w->pRealF1 ? ((PFN)VS(w->pRealF1,0x68))(w->pRealF1) : TRUE;
+    LOG("IDXGIFactory1::IsCurrent → %d",b); return b;
+}
+
+/* --- IDXGIFactory2 helpers --- */
+#define F2_GUARD(ret) do{ if(!w->pRealF2){ LOG("IDXGIFactory2 not available (Win7)"); return ret; } }while(0)
+
+static BOOL STDMETHODCALLTYPE WF_IsWindowedStereoEnabled(WrapFactory*w)
+{
+    typedef BOOL(STDMETHODCALLTYPE*PFN)(void*);
+    LOG("IDXGIFactory2::IsWindowedStereoEnabled");
+    F2_GUARD(FALSE);
+    return ((PFN)VS(w->pRealF2,0x70))(w->pRealF2);
+}
+
+/* =========================================================
+ * ======== INTEROP D3D12 -> D3D11 ========
+ * Le DXGI réel de Win7 ne sait pas créer de swapchain pour une
+ * ID3D12CommandQueue (CreateSwapChainForHwnd renvoie E_NOINTERFACE).
+ * On crée donc un device D3D11 caché, on lui fait créer la vraie
+ * swapchain, et on expose à l'app D3D12 des ID3D12Resource "miroirs"
+ * (ressources partagées D3D12<->D3D11) copiées dans le back buffer
+ * réel à chaque Present.
+ * ========================================================= */
+
+/* Remonte une ID3D12CommandQueue vers son ID3D12Device via GetDevice
+ * (ID3D12DeviceChild::GetDevice, vtable offset 0x38 — cf. tableau plus haut).
+ * Retourne une référence à libérer par l'appelant, ou NULL. */
+static IUnknown* D3D12_GetDeviceFromQueue(IUnknown *pCQ)
+{
+    typedef HRESULT (STDMETHODCALLTYPE *PFN_GetDevice)(void*, REFIID, void**);
+    void *pDev=NULL;
+    if(!pCQ) return NULL;
+    HRESULT hr=((PFN_GetDevice)VS(pCQ,D3D12CQ_GetDevice_OFF))(pCQ,&IID_ID3D12Device,&pDev);
+    LOG("D3D12_GetDeviceFromQueue: GetDevice(IID_ID3D12Device) = 0x%08X pDev=%p",(unsigned)hr,pDev);
+    if(FAILED(hr)) return NULL;
+    return (IUnknown*)pDev;
+}
+
+/*
+ * D3D12_CreateSharedRT — Approche D3D11-first (Win7/WDDM1.x compatible)
+ *
+ * POURQUOI L'ANCIENNE APPROCHE ÉCHOUE :
+ *   ID3D12Device::CreateCommittedResource avec HEAP_FLAG_SHARED (0x1) lance
+ *   une CPP_EH_EXCEPTION en interne sur Win7 (WDDM 1.1/1.2) quelle que soit
+ *   la combinaison de flags. HEAP_FLAG_SHARED / NT handles nécessitent WDDM 2.0+
+ *   (Windows 10). Sur Win7, d3d12.dll (rétroporié) simule les API D3D12 mais
+ *   ne peut pas créer des ressources partagées via le mécanisme NT handle car
+ *   le kernel WDDM 1.x ne le supporte pas.
+ *
+ * SOLUTION — Partage classique Win7 via IDXGIResource::GetSharedHandle :
+ *   1. Créer une D3D11 Texture2D avec D3D11_RESOURCE_MISC_SHARED (0x2)
+ *      → obtenir un HANDLE Win32 via IDXGIResource::GetSharedHandle
+ *   2. Ouvrir ce HANDLE côté D3D12 via ID3D12Device::OpenSharedHandle
+ *      → obtenir un ID3D12Resource qui pointe vers la même mémoire GPU
+ *
+ * Ce mécanisme utilise le vieux "legacy DXGI shared surfaces" disponible
+ * depuis Direct3D 10/11 Win7, et fonctionne avec WDDM 1.x.
+ *
+ * Paramètres :
+ *   pD3D11Dev  — ID3D11Device* (device D3D11 interne de l'interop)
+ *   pD3D12Dev  — ID3D12Device* (device D3D12 du jeu)
+ *   W, H, fmt  — dimensions et format
+ *   ppD3D11Tex — [out] ID3D11Texture2D* créée côté D3D11
+ *   ppD3D12Res — [out] ID3D12Resource* ouverte côté D3D12
+ *
+ * Note : *ppD3D11Tex et *ppD3D12Res doivent être Release'd par l'appelant.
+ */
+static HRESULT D3D12_CreateSharedRT(
+    void *pD3D11Dev, IUnknown *pD3D12Dev,
+    UINT W, UINT H, DXGI_FORMAT fmt,
+    void **ppD3D11Tex, void **ppD3D12Res)
+{
+    typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateTexture2D)(
+        void*, const D3D11_TEXTURE2D_DESC_MIN*, const void*, void**);
+    typedef HRESULT (STDMETHODCALLTYPE *PFN_GetSharedHandle)(void*, HANDLE*);
+    typedef HRESULT (STDMETHODCALLTYPE *PFN_OpenSharedHandle)(void*, HANDLE, REFIID, void**);
+
+    HRESULT hr;
+    void   *pTex  = NULL;
+    HANDLE  hWin32 = NULL;
+    void   *pD3D12Res = NULL;
+
+    LOG("D3D12_CreateSharedRT: %ux%u fmt=%u (D3D11-first, legacy Win32 share)", W, H, (unsigned)fmt);
+
+    /* ── Étape 1 : Créer la Texture2D D3D11 partageable ───────────────────
+     * D3D11_RESOURCE_MISC_SHARED (0x2) : active le partage via GetSharedHandle.
+     * D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX (0x4) : NE PAS utiliser car
+     *   OpenSharedHandle côté D3D12 ne supporte pas IDXGIKeyedMutex.
+     * D3D11_BIND_RENDER_TARGET | SHADER_RESOURCE : RTV pour le rendu D3D11,
+     *   SRV pas strictement requis mais utile pour debug/validation.
+     */
+    {
+        D3D11_TEXTURE2D_DESC_MIN desc; ZeroMemory(&desc,sizeof(desc));
+        desc.Width          = W;
+        desc.Height         = H;
+        desc.MipLevels      = 1;
+        desc.ArraySize      = 1;
+        desc.Format         = fmt;
+        desc.SampleDesc.Count   = 1;
+        desc.SampleDesc.Quality = 0;
+        desc.Usage          = D3D11_USAGE_DEFAULT_;
+        desc.BindFlags      = D3D11_BIND_RENDER_TARGET_ | D3D11_BIND_SHADER_RESOURCE_;
+        desc.CPUAccessFlags = 0;
+        desc.MiscFlags      = D3D11_RESOURCE_MISC_SHARED_; /* 0x2, pas KEYEDMUTEX */
+
+        /* ID3D11Device::CreateTexture2D = slot 5 (0-indexed après IUnknown 0-2,
+         * GetImmediateContext=3, CreateDeferredContext=4) = offset 0x28.
+         * Ref: ID3D11Device vtable (d3d11.h) */
+        hr = ((PFN_CreateTexture2D)VS(pD3D11Dev, 0x28))(pD3D11Dev, &desc, NULL, &pTex);
+        LOG("D3D12_CreateSharedRT: CreateTexture2D = 0x%08X pTex=%p", (unsigned)hr, pTex);
+        if (FAILED(hr) || !pTex) return hr;
+    }
+
+    /* ── Étape 2 : Obtenir le HANDLE Win32 via IDXGIResource::GetSharedHandle ──
+     * Vtable IDXGIResource (layout exact depuis dxgi.h) :
+     *   IUnknown            : QI=0x00, AddRef=0x08, Release=0x10
+     *   IDXGIObject         : SetPrivateData=0x18, SetPrivateDataInterface=0x20,
+     *                         GetPrivateData=0x28, GetParent=0x30
+     *   IDXGIDeviceSubObject: GetDevice=0x38
+     *   IDXGIResource       : GetSharedHandle=0x40  ← slot 8 (0-indexed)
+     *                         GetUsage=0x48, SetEvictionPriority=0x50, ...
+     */
+    {
+        void *pDXGIRes = NULL;
+        hr = ((IUnknown*)pTex)->lpVtbl->QueryInterface((IUnknown*)pTex,
+             &IID_IDXGIResource, &pDXGIRes);
+        LOG("D3D12_CreateSharedRT: QI(IDXGIResource) = 0x%08X pDXGIRes=%p",
+            (unsigned)hr, pDXGIRes);
+        if (FAILED(hr) || !pDXGIRes) {
+            ((IUnknown*)pTex)->lpVtbl->Release((IUnknown*)pTex);
+            return hr;
+        }
+
+        hr = ((PFN_GetSharedHandle)VS(pDXGIRes, 0x40))(pDXGIRes, &hWin32);
+        ((IUnknown*)pDXGIRes)->lpVtbl->Release((IUnknown*)pDXGIRes);
+        LOG("D3D12_CreateSharedRT: GetSharedHandle = 0x%08X hWin32=%p",
+            (unsigned)hr, (void*)hWin32);
+        /*
+         * Sur Win7, GetSharedHandle retourne S_OK avec hWin32==NULL si la texture
+         * a été créée sans les bons flags (ex: device sans BGRA support, ou adapter
+         * non-partageable). On traite hWin32==NULL comme un échec.
+         */
+        if (FAILED(hr) || !hWin32) {
+            ((IUnknown*)pTex)->lpVtbl->Release((IUnknown*)pTex);
+            return (FAILED(hr)) ? hr : E_FAIL;
+        }
+    }
+
+    /* ── Étape 3 : Ouvrir le HANDLE côté D3D12 ───────────────────────────
+     * ID3D12Device::OpenSharedHandle (offset 0x100 dans la vtable ID3D12Device).
+     * Ce call convertit le HANDLE Win32 en ID3D12Resource.
+     * On demande IID_ID3D12Resource directement.
+     */
+    hr = ((PFN_OpenSharedHandle)VS(pD3D12Dev, D3D12DEV_OpenSharedHandle_OFF))(
+        pD3D12Dev, hWin32, &IID_ID3D12Resource, &pD3D12Res);
+    LOG("D3D12_CreateSharedRT: OpenSharedHandle(D3D12) = 0x%08X pD3D12Res=%p",
+        (unsigned)hr, pD3D12Res);
+
+    if (FAILED(hr) || !pD3D12Res) {
+        /* OpenSharedHandle a échoué — essayer avec IID_IUnknown_ */
+        LOG("D3D12_CreateSharedRT: retry OpenSharedHandle avec IID_IUnknown_...");
+        hr = ((PFN_OpenSharedHandle)VS(pD3D12Dev, D3D12DEV_OpenSharedHandle_OFF))(
+            pD3D12Dev, hWin32, &IID_IUnknown_, &pD3D12Res);
+        LOG("D3D12_CreateSharedRT: retry OpenSharedHandle = 0x%08X pD3D12Res=%p",
+            (unsigned)hr, pD3D12Res);
+    }
+
+    if (FAILED(hr) || !pD3D12Res) {
+        ((IUnknown*)pTex)->lpVtbl->Release((IUnknown*)pTex);
+        D3D12_DumpInfoQueue(pD3D12Dev);
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+
+    LOG("D3D12_CreateSharedRT: OK pD3D11Tex=%p pD3D12Res=%p hWin32=%p",
+        pTex, pD3D12Res, (void*)hWin32);
+
+    *ppD3D11Tex  = pTex;
+    *ppD3D12Res  = pD3D12Res;
+    /* hWin32 n'est PAS un handle kernel à fermer — c'est un pointeur opaque
+     * DXGI (GetSharedHandle retourne un pseudo-handle, pas un vrai HANDLE NT).
+     * Ne pas appeler CloseHandle dessus. */
+    return S_OK;
+}
+
+/*
+ * D3D12Interop_Create : crée le device D3D11 caché, la vraie swapchain
+ * D3D11 (via CreateSwapChainForHwnd sur le device caché), puis les
+ * ressources partagées pour chaque back buffer demandé.
+ *
+ * pD3D12CQ : ID3D12CommandQueue* passé par le jeu (ref NON consommée ici)
+ * pDesc    : DXGI_SWAP_CHAIN_DESC1* (peut être NULL si Fullscreen via pFD seul — non géré ici)
+ * ppRealSC : reçoit la vraie IDXGISwapChain1* (D3D11) créée, ref à la charge de l'appelant
+ *
+ * Retourne NULL en cas d'échec (logué).
+ */
+static D3D12Interop* D3D12Interop_Create(IUnknown *pD3D12CQ, HWND hwnd,
+    const void *pDescVoid, IUnknown **ppRealSC)
+{
+    const DXGI_SWAP_CHAIN_DESC1 *pDesc=(const DXGI_SWAP_CHAIN_DESC1*)pDescVoid;
+    D3D12Interop *it=NULL;
+    HMODULE hD3D11=NULL;
+    PFN_D3D11CreateDevice pfnCreate=NULL;
+    void *pD3D11Dev=NULL,*pD3D11Ctx=NULL;
+    IUnknown *pD3D12Dev=NULL;
+    HRESULT hr;
+    UINT i;
+
+    if(!pDesc) { LOG("D3D12Interop_Create: pDesc==NULL, abandon"); return NULL; }
+
+    LOG("D3D12Interop_Create: %ux%u fmt=%u BufferCount=%u Flags=0x%X",
+        pDesc->Width,pDesc->Height,(unsigned)pDesc->Format,pDesc->BufferCount,pDesc->Flags);
+
+    if(pDesc->BufferCount==0 || pDesc->BufferCount>D3D12_INTEROP_MAX_BUFFERS) {
+        LOG("D3D12Interop_Create: BufferCount=%u hors limites",pDesc->BufferCount);
+        return NULL;
+    }
+
+    pD3D12Dev = D3D12_GetDeviceFromQueue(pD3D12CQ);
+    if(!pD3D12Dev) { LOG("D3D12Interop_Create: impossible de remonter au ID3D12Device"); return NULL; }
+
+    /* 1. Charger LE VRAI d3d11.dll système (chemin absolu System32).
+     * IMPORTANT : LoadLibraryW(L"d3d11.dll") avec un nom relatif suit l'ordre
+     * de recherche standard, qui priorise le dossier de l'exe — si celui-ci
+     * contient un autre d3d11.dll (proxy/wrapper tiers, ReShade, etc.), on
+     * chargerait CE wrapper, qui peut lui-même réinjecter/hooker → boucle
+     * infinie → EXCEPTION_STACK_OVERFLOW (observé). On force donc le chemin
+     * System32 explicite via GetSystemDirectoryW. */
+    {
+        WCHAR sysdir[MAX_PATH]; WCHAR path[MAX_PATH+32];
+        UINT n=GetSystemDirectoryW(sysdir,MAX_PATH);
+        if(n>0 && n<MAX_PATH) {
+            _snwprintf(path,MAX_PATH+31,L"%s\\d3d11.dll",sysdir);
+            path[MAX_PATH+31]=0;
+            hD3D11=LoadLibraryW(path);
+            LOG("D3D12Interop_Create: LoadLibraryW(%S) = %p",path,(void*)hD3D11);
+        }
+    }
+    if(!hD3D11) hD3D11=GetModuleHandleW(L"d3d11.dll"); /* fallback ultime */
+    if(!hD3D11) { LOG("D3D12Interop_Create: LoadLibrary d3d11.dll (System32) échoué"); goto fail; }
+    pfnCreate=(PFN_D3D11CreateDevice)GetProcAddress(hD3D11,"D3D11CreateDevice");
+    if(!pfnCreate) { LOG("D3D12Interop_Create: GetProcAddress D3D11CreateDevice échoué"); goto fail; }
+
+    /*
+     * 1. Créer le device D3D11 caché sur LE MÊME adapter que D3D12.
+     *
+     * Si le device D3D11 est sur un adapter différent, GetSharedHandle
+     * retourne NULL (S_OK) — la texture n'est pas partageable cross-adapter.
+     *
+     * Stratégie :
+     *   a) Obtenir le LUID de l'adapter D3D12 via ID3D12Device::GetAdapterLuid
+     *   b) Énumérer les adapters DXGI pour trouver celui ayant le même LUID
+     *   c) Créer le device D3D11 sur cet adapter explicitement
+     *   d) Fallback : D3D_DRIVER_TYPE_HARDWARE si la recherche échoue
+     *
+     * Flag D3D11_CREATE_DEVICE_BGRA_SUPPORT (0x20) : nécessaire pour que
+     * les textures BGRA (format B8G8R8A8) soient partageables via DXGI.
+     */
+    {
+        D3D_FEATURE_LEVEL_ levels[2]={D3D_FEATURE_LEVEL_11_1_,D3D_FEATURE_LEVEL_11_0_};
+        D3D_FEATURE_LEVEL_ outLevel=0;
+        void *pDXGIAdapterForD3D11 = NULL;
+
+        /* a) Obtenir le LUID D3D12 via ID3D12Device::GetAdapterLuid
+         *    GetAdapterLuid = offset 0x158 dans ID3D12Device vtable.
+         *    Elle retourne LUID par valeur (pas pointeur) sur certaines versions ;
+         *    on utilise une signature sûre avec pointeur de sortie. */
+        {
+            typedef void (STDMETHODCALLTYPE *PFN_GetAdapterLuid)(void*, LUID*);
+            LUID d3d12Luid = {0,0};
+            ((PFN_GetAdapterLuid)VS(pD3D12Dev, 0x158))(pD3D12Dev, &d3d12Luid);
+            LOG("D3D12Interop_Create: D3D12 adapter LUID={%08X,%08X}",
+                (unsigned)d3d12Luid.LowPart, (unsigned)d3d12Luid.HighPart);
+
+            /* b) Chercher l'adapter DXGI avec ce LUID via g_pfnFactory1 */
+            if ((d3d12Luid.LowPart || d3d12Luid.HighPart) && g_pfnFactory1) {
+                void *pTmpFactory=NULL;
+                if (SUCCEEDED(g_pfnFactory1(&IID_IDXGIFactory1, &pTmpFactory)) && pTmpFactory) {
+                    typedef HRESULT(STDMETHODCALLTYPE*PFN_EnumAdapters1)(void*,UINT,void**);
+                    for(UINT ai=0;;ai++) {
+                        void *pAdap=NULL;
+                        HRESULT har=((PFN_EnumAdapters1)VS(pTmpFactory,0x60))(pTmpFactory,ai,&pAdap);
+                        if(FAILED(har)||!pAdap) break;
+                        /* GetDesc1 = offset 0x50 dans IDXGIAdapter1 vtable */
+                        typedef HRESULT(STDMETHODCALLTYPE*PFN_GetDesc1)(void*,void*);
+                        BYTE descBuf[sizeof(DXGI_ADAPTER_DESC)*2];
+                        if(SUCCEEDED(((PFN_GetDesc1)VS(pAdap,0x50))(pAdap,descBuf))) {
+                            /* DXGI_ADAPTER_DESC1 : LUID à l'offset 280 (0x118) */
+                            LUID *pL=(LUID*)(descBuf+280);
+                            LOG("D3D12Interop_Create: adapter[%u] LUID={%08X,%08X}",
+                                ai,(unsigned)pL->LowPart,(unsigned)pL->HighPart);
+                            if(pL->LowPart==d3d12Luid.LowPart && pL->HighPart==d3d12Luid.HighPart) {
+                                pDXGIAdapterForD3D11=pAdap;
+                                LOG("D3D12Interop_Create: adapter D3D11 sélectionné = adapter[%u]",ai);
+                                break;
+                            }
+                        }
+                        ((IUnknown*)pAdap)->lpVtbl->Release((IUnknown*)pAdap);
+                    }
+                    ((IUnknown*)pTmpFactory)->lpVtbl->Release((IUnknown*)pTmpFactory);
+                }
+            }
+        }
+
+        /* c) Créer le device D3D11 sur l'adapter trouvé (ou hardware par défaut) */
+        {
+            /* D3D11_CREATE_DEVICE_BGRA_SUPPORT=0x20 : requis pour que les
+             * textures créées avec MISC_SHARED soient partageables via DXGI
+             * sur Win7 (permet les formats BGRA + assure la compatibilité
+             * du path de partage legacy). */
+            UINT flags = 0x20; /* D3D11_CREATE_DEVICE_BGRA_SUPPORT */
+            D3D_DRIVER_TYPE_ dtype = pDXGIAdapterForD3D11
+                ? D3D_DRIVER_TYPE_UNKNOWN_  /* obligatoire si pAdapter != NULL */
+                : D3D_DRIVER_TYPE_HARDWARE_;
+
+            hr=pfnCreate((IUnknown*)pDXGIAdapterForD3D11, dtype, NULL, flags,
+                levels, 2, D3D11_SDK_VERSION_, &pD3D11Dev, &outLevel, &pD3D11Ctx);
+
+            if(FAILED(hr)) {
+                /* Retry sans D3D_FEATURE_LEVEL list */
+                hr=pfnCreate((IUnknown*)pDXGIAdapterForD3D11, dtype, NULL, flags,
+                    NULL, 0, D3D11_SDK_VERSION_, &pD3D11Dev, &outLevel, &pD3D11Ctx);
+            }
+            if(FAILED(hr) && pDXGIAdapterForD3D11) {
+                /* Fallback adapter par défaut si l'adapter spécifique échoue */
+                LOG("D3D12Interop_Create: retry D3D11CreateDevice sans adapter explicite");
+                hr=pfnCreate(NULL, D3D_DRIVER_TYPE_HARDWARE_, NULL, flags,
+                    NULL, 0, D3D11_SDK_VERSION_, &pD3D11Dev, &outLevel, &pD3D11Ctx);
+            }
+            if(pDXGIAdapterForD3D11)
+                ((IUnknown*)pDXGIAdapterForD3D11)->lpVtbl->Release((IUnknown*)pDXGIAdapterForD3D11);
+        }
+
+        LOG("D3D12Interop_Create: D3D11CreateDevice = 0x%08X pDev=%p level=0x%X",
+            (unsigned)hr, pD3D11Dev, (unsigned)outLevel);
+        if(FAILED(hr)||!pD3D11Dev) goto fail;
+    }
+
+    /* 2. Créer la vraie swapchain D3D11 via QI du device caché vers IDXGIDevice,
+     *    puis remonter à la factory réelle pour CreateSwapChainForHwnd. */
+    {
+        void *pDXGIDev=NULL,*pAdapter=NULL,*pFactory=NULL,*pFactory2=NULL,*pRealSC=NULL;
+        typedef HRESULT(STDMETHODCALLTYPE*PFN_GetParent)(void*,REFIID,void**);
+        typedef HRESULT(STDMETHODCALLTYPE*PFN_GetAdapter)(void*,void**);
+        typedef HRESULT(STDMETHODCALLTYPE*PFN_CreateSwapChainForHwnd)(
+            void*,IUnknown*,HWND,const DXGI_SWAP_CHAIN_DESC1*,const void*,void*,void**);
+
+        hr=((IUnknown*)pD3D11Dev)->lpVtbl->QueryInterface((IUnknown*)pD3D11Dev,&IID_IDXGIDevice,&pDXGIDev);
+        LOG("D3D12Interop_Create: QI(IDXGIDevice) = 0x%08X",(unsigned)hr);
+        if(FAILED(hr)) goto fail;
+
+        /* IDXGIDevice::GetAdapter, vtable offset 0x38 (après IDXGIObject 7 méthodes) */
+        hr=((PFN_GetAdapter)VS(pDXGIDev,0x38))(pDXGIDev,&pAdapter);
+        ((IUnknown*)pDXGIDev)->lpVtbl->Release((IUnknown*)pDXGIDev);
+        LOG("D3D12Interop_Create: IDXGIDevice::GetAdapter = 0x%08X pAdapter=%p",(unsigned)hr,pAdapter);
+        if(FAILED(hr)||!pAdapter) goto fail;
+
+        /* IDXGIObject::GetParent (slot 6 = offset 0x30, cf. SC_GetParent) vers la factory */
+        hr=((PFN_GetParent)VS(pAdapter,0x30))(pAdapter,&IID_IDXGIFactory2,&pFactory2);
+        ((IUnknown*)pAdapter)->lpVtbl->Release((IUnknown*)pAdapter);
+        LOG("D3D12Interop_Create: GetParent(IDXGIFactory2) = 0x%08X pFactory2=%p",(unsigned)hr,pFactory2);
+        if(FAILED(hr)||!pFactory2) goto fail;
+        pFactory=pFactory2;
+
+        /* IDXGIFactory2::CreateSwapChainForHwnd, vtable offset 0x78.
+         * Le DXGI Win7 (même avec Platform Update) ne supporte pas les
+         * SwapEffect FLIP_DISCARD/FLIP_SEQUENTIAL (introduits avec le
+         * compositeur DWM de Win8+). Comme cette swapchain D3D11 cachée
+         * n'est jamais vue par l'app D3D12 (on ne fait que copier dans
+         * son back buffer), on force un SwapEffect/Scaling compatibles
+         * Win7 dans une copie locale de la desc. */
+        {
+            DXGI_SWAP_CHAIN_DESC1 d = *pDesc;
+            d.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+            d.Scaling    = DXGI_SCALING_STRETCH;
+            d.AlphaMode  = DXGI_ALPHA_MODE_UNSPECIFIED;
+            d.Flags      = 0;
+            d.BufferCount= 1; /* DISCARD impose BufferCount<=1 sur certains drivers */
+            hr=((PFN_CreateSwapChainForHwnd)VS(pFactory,0x78))(
+                pFactory,(IUnknown*)pD3D11Dev,hwnd,&d,NULL,NULL,&pRealSC);
+        }
+        ((IUnknown*)pFactory)->lpVtbl->Release((IUnknown*)pFactory);
+        LOG("D3D12Interop_Create: CreateSwapChainForHwnd(D3D11) = 0x%08X pRealSC=%p",(unsigned)hr,pRealSC);
+        if(FAILED(hr)||!pRealSC) goto fail;
+
+        *ppRealSC=(IUnknown*)pRealSC;
+    }
+
+    /* 3. Allouer le contexte interop et créer les ressources partagées */
+    it=HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,sizeof(*it));
+    if(!it) goto fail;
+    it->pD3D11Dev=pD3D11Dev;
+    it->pD3D11Ctx=pD3D11Ctx;
+    it->pD3D12Dev=pD3D12Dev; /* ref transférée */
+    pD3D12Dev=NULL;
+    it->BufferCount=pDesc->BufferCount;
+    it->Width=pDesc->Width;
+    it->Height=pDesc->Height;
+    it->Format=pDesc->Format;
+    ((IUnknown*)pD3D11Dev)->lpVtbl->QueryInterface((IUnknown*)pD3D11Dev,&IID_ID3D11Device1,&it->pD3D11Dev1);
+
+    /* Approche D3D11-first : créer les textures côté D3D11 avec MISC_SHARED,
+     * puis ouvrir côté D3D12 via GetSharedHandle+OpenSharedHandle (WDDM 1.x). */
+    for(i=0;i<it->BufferCount;i++) {
+        void *pD3D11Tex=NULL, *pD3D12Res=NULL;
+        hr=D3D12_CreateSharedRT(it->pD3D11Dev, it->pD3D12Dev,
+                                it->Width, it->Height, it->Format,
+                                &pD3D11Tex, &pD3D12Res);
+        LOG("D3D12Interop_Create: D3D12_CreateSharedRT[%u] = 0x%08X pTex=%p pRes=%p",
+            i, (unsigned)hr, pD3D11Tex, pD3D12Res);
+        if(FAILED(hr)) goto fail;
+        it->pD3D11Tex   [i] = pD3D11Tex;
+        it->pD3D11Shared[i] = pD3D11Tex;  /* alias — GetBuffer D3D11 utilise ceci */
+        it->pD3D12Res   [i] = pD3D12Res;
+    }
+
+    LOG("D3D12Interop_Create: OK, %u buffers %ux%u",it->BufferCount,it->Width,it->Height);
+    return it;
+
+fail:
+    if(pD3D12Dev) pD3D12Dev->lpVtbl->Release(pD3D12Dev);
+    if(it) D3D12Interop_Destroy(it);
+    else {
+        if(pD3D11Ctx) ((IUnknown*)pD3D11Ctx)->lpVtbl->Release((IUnknown*)pD3D11Ctx);
+        if(pD3D11Dev) ((IUnknown*)pD3D11Dev)->lpVtbl->Release((IUnknown*)pD3D11Dev);
+    }
+    return NULL;
+}
+
+static void D3D12Interop_Destroy(D3D12Interop *it)
+{
+    UINT i;
+    if(!it) return;
+    for(i=0;i<it->BufferCount;i++) {
+        /* pD3D11Shared[i] == pD3D11Tex[i] : libérer une seule fois via pD3D11Tex */
+        if(it->pD3D12Res[i])  ((IUnknown*)it->pD3D12Res[i])->lpVtbl->Release((IUnknown*)it->pD3D12Res[i]);
+        if(it->pD3D11Tex[i])  ((IUnknown*)it->pD3D11Tex[i])->lpVtbl->Release((IUnknown*)it->pD3D11Tex[i]);
+        /* Pas de CloseHandle : GetSharedHandle retourne un pseudo-handle DXGI,
+         * pas un vrai HANDLE kernel. Ne pas appeler CloseHandle dessus. */
+    }
+    if(it->pD3D11Dev1) ((IUnknown*)it->pD3D11Dev1)->lpVtbl->Release((IUnknown*)it->pD3D11Dev1);
+    if(it->pD3D11Ctx)  ((IUnknown*)it->pD3D11Ctx)->lpVtbl->Release((IUnknown*)it->pD3D11Ctx);
+    if(it->pD3D11Dev)  ((IUnknown*)it->pD3D11Dev)->lpVtbl->Release((IUnknown*)it->pD3D11Dev);
+    if(it->pD3D12Dev)  ((IUnknown*)it->pD3D12Dev)->lpVtbl->Release((IUnknown*)it->pD3D12Dev);
+    HeapFree(GetProcessHeap(),0,it);
+}
+
+/* GetBuffer pour le mode interop : renvoie l'ID3D12Resource "miroir" #Buf à l'app.
+ * riid attendu = IID_ID3D12Resource (le jeu fait IID_PPV_ARGS(&pRes)) ; comme on
+ * n'a pas le GUID exact en dur, on AddRef et on renvoie l'IUnknown tel quel —
+ * le jeu fait un QueryInterface implicite via la vtable C++ donc tout pointeur
+ * vers un vrai objet ID3D12Resource (créé par CreateCommittedResource) fonctionne
+ * indépendamment du riid demandé, sa vtable supportant déjà cette interface. */
+static HRESULT D3D12Interop_GetBuffer(WrapSC *w, UINT Buf, REFIID riid, void **pp)
+{
+    D3D12Interop *it=w->interop;
+    (void)riid;
+    if(!it) return E_NOTIMPL;
+    if(Buf>=it->BufferCount) { LOG("D3D12Interop_GetBuffer: Buf=%u hors limites (%u)",Buf,it->BufferCount); return DXGI_ERROR_INVALID_CALL; }
+    if(!it->pD3D12Res[Buf]) return E_FAIL;
+    ((IUnknown*)it->pD3D12Res[Buf])->lpVtbl->AddRef((IUnknown*)it->pD3D12Res[Buf]);
+    *pp=it->pD3D12Res[Buf];
+    LOG("D3D12Interop_GetBuffer(%u) -> pD3D12Res=%p",Buf,*pp);
+    return S_OK;
+}
+
+/* Present pour le mode interop : copie la texture D3D11 partagée correspondant
+ * au buffer "courant" vers le back buffer réel de la swapchain D3D11, puis
+ * Present sur la swapchain réelle. L'app D3D12 gère elle-même son indexation
+ * (GetCurrentBackBufferIndex côté D3D12 vient de son propre device, pas de
+ * notre swapchain) ; on se base donc sur le compteur de présentations modulo
+ * BufferCount pour savoir quelle ressource miroir vient d'être remplie —
+ * c'est la convention standard DXGI_SWAP_EFFECT_FLIP_* (round-robin). */
+static HRESULT D3D12Interop_Present(WrapSC *w, UINT SyncInterval, UINT Flags, HRESULT *outHr)
+{
+    D3D12Interop *it=w->interop;
+    typedef void  (STDMETHODCALLTYPE*PFN_CopyResource)(void*,void*,void*);
+    typedef HRESULT(STDMETHODCALLTYPE*PFN_Present)(void*,UINT,UINT);
+    typedef HRESULT(STDMETHODCALLTYPE*PFN_GetBuffer)(void*,UINT,REFIID,void**);
+    UINT idx;
+    HRESULT hr;
+    void *pRealBackBuf=NULL;
+    void *pCtx=NULL;
+
+    if(!it) return E_NOTIMPL;
+    idx = it->presentIndex % it->BufferCount;
+
+    LOG("D3D12Interop_Present: idx=%u pD3D11Ctx=%p pD3D11Shared[idx]=%p",
+        idx,(void*)it->pD3D11Ctx,(void*)it->pD3D11Shared[idx]);
+    if(!it->pD3D11Ctx)    { LOG("D3D12Interop_Present: pD3D11Ctx==NULL !"); *outHr=E_FAIL; return E_FAIL; }
+    if(!it->pD3D11Shared[idx]) { LOG("D3D12Interop_Present: pD3D11Shared[%u]==NULL !",idx); *outHr=E_FAIL; return E_FAIL; }
+
+    /* Récupérer le back buffer courant de la VRAIE swapchain D3D11.
+     * En mode DISCARD+BufferCount=1, le seul buffer est toujours à l'index 0. */
+    hr=((PFN_GetBuffer)VS(w->base.pReal,0x48))(w->base.pReal,0,&IID_ID3D11Texture2D,&pRealBackBuf);
+    LOG("D3D12Interop_Present: GetBuffer(0) = 0x%08X pRealBackBuf=%p",(unsigned)hr,(void*)pRealBackBuf);
+    if(FAILED(hr)||!pRealBackBuf) { LOG("D3D12Interop_Present: GetBuffer échoué"); *outHr=FAILED(hr)?hr:E_FAIL; return *outHr; }
+
+    /* Récupérer le contexte immédiat D3D11 (GetImmediateContext = slot 40 = 0x140) */
+    {
+        typedef void(STDMETHODCALLTYPE*PFN_GetImmCtx)(void*,void**);
+        ((PFN_GetImmCtx)VS(it->pD3D11Dev,0x140))(it->pD3D11Dev,&pCtx);
+    }
+    if(!pCtx) pCtx=it->pD3D11Ctx;
+    LOG("D3D12Interop_Present: pCtx=%p",(void*)pCtx);
+
+    /* Copier la texture miroir D3D11 (remplie via la ressource D3D12 partagée)
+     * vers le back buffer réel de la swapchain D3D11.
+     * ID3D11DeviceContext::CopyResource = slot 37 = offset 0x128. */
+    LOG("D3D12Interop_Present: --> CopyResource(dst=%p, src=%p)",(void*)pRealBackBuf,(void*)it->pD3D11Shared[idx]);
+
+    /* Vérification des formats avant CopyResource pour détecter un mismatch.
+     * ID3D11Texture2D::GetDesc = slot 10 (après IUnknown(0-2)+
+     * ID3D11DeviceChild(3-6)+ID3D11Resource(GetType=7,SetEvictionPriority=8,
+     * GetEvictionPriority=9)+GetDesc(10)) = offset 0x50.
+     * D3D11_TEXTURE2D_DESC = { UINT Width,Height,MipLevels,ArraySize,
+     *   DXGI_FORMAT Format, DXGI_SAMPLE_DESC SampleDesc, ... } */
+    {
+        typedef void(STDMETHODCALLTYPE*PFN_GetDesc)(void*,void*);
+        struct { UINT W,H,Mip,Arr; DXGI_FORMAT Fmt; UINT SmpCnt,SmpQual,Usage,Bind,CPU,Misc; } dstDesc={0},srcDesc={0};
+        ((PFN_GetDesc)VS(pRealBackBuf,0x50))(pRealBackBuf,&dstDesc);
+        ((PFN_GetDesc)VS(it->pD3D11Shared[idx],0x50))(it->pD3D11Shared[idx],&srcDesc);
+        LOG("D3D12Interop_Present: dst desc W=%u H=%u Fmt=%u Bind=0x%X | src desc W=%u H=%u Fmt=%u Bind=0x%X",
+            dstDesc.W,dstDesc.H,(unsigned)dstDesc.Fmt,dstDesc.Bind,
+            srcDesc.W,srcDesc.H,(unsigned)srcDesc.Fmt,srcDesc.Bind);
+    }
+    ((PFN_CopyResource)VS(pCtx,0x128))(pCtx,pRealBackBuf,it->pD3D11Shared[idx]);
+    LOG("D3D12Interop_Present: CopyResource OK");
+
+    /* Libérer la ref GetBuffer et le contexte (GetImmediateContext AddRef) */
+    ((IUnknown*)pRealBackBuf)->lpVtbl->Release((IUnknown*)pRealBackBuf);
+    if(pCtx!=it->pD3D11Ctx) ((IUnknown*)pCtx)->lpVtbl->Release((IUnknown*)pCtx);
+
+    /* Présenter la swapchain réelle */
+    LOG("D3D12Interop_Present: w->base.pReal=%p",(void*)w->base.pReal);
+    hr=((PFN_Present)VS(w->base.pReal,0x40))(w->base.pReal,SyncInterval,Flags);
+    LOG("D3D12Interop_Present: Present réel = 0x%08X",(unsigned)hr);
+    it->presentIndex++;
+    *outHr=hr;
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE WF_CreateSwapChainForHwnd(WrapFactory*w,IUnknown*pDev,HWND hwnd,const void*pD,const void*pFD,void*pRO,void**pp)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,IUnknown*,HWND,const void*,const void*,void*,void**);
+    LOG("IDXGIFactory2::CreateSwapChainForHwnd(hwnd=%p)",(void*)hwnd);
+    F2_GUARD(DXGI_ERROR_UNSUPPORTED);
+    if(!pp) return E_INVALIDARG; *pp=NULL;
+
+    /* Détection D3D12 : pDev est-il une ID3D12CommandQueue ? Le DXGI réel
+     * de Win7 ne sait pas QI(pDev,IDXGIDevice) dans ce cas (E_NOINTERFACE),
+     * il faut donc passer par l'interop D3D11. */
+    {
+        void *pCQ=NULL;
+        HRESULT hrcq = pDev ? pDev->lpVtbl->QueryInterface(pDev,&IID_ID3D12CommandQueue,&pCQ) : E_POINTER;
+        if(SUCCEEDED(hrcq) && pCQ) {
+            IUnknown *pRealSC=NULL;
+            D3D12Interop *it;
+            LOG("  CreateSwapChainForHwnd: ID3D12CommandQueue détectée (%p) -> interop D3D11",pCQ);
+            it = D3D12Interop_Create((IUnknown*)pCQ, hwnd, pD, &pRealSC);
+            ((IUnknown*)pCQ)->lpVtbl->Release((IUnknown*)pCQ);
+            if(!it || !pRealSC) {
+                LOG("  CreateSwapChainForHwnd: D3D12Interop_Create a échoué");
+                if(pRealSC) pRealSC->lpVtbl->Release(pRealSC);
+                LOG_LEAVE("IDXGIFactory2::CreateSwapChainForHwnd",E_FAIL);
+                return E_FAIL;
+            }
+            {
+                WrapSC *wsc=NULL;
+                HRESULT hr2=WrapSC_Create2(pRealSC,&IID_IDXGISwapChain1,pp,&wsc);
+                pRealSC->lpVtbl->Release(pRealSC);
+                if(FAILED(hr2)||!wsc) {
+                    LOG("  CreateSwapChainForHwnd: WrapSC_Create2 = 0x%08X",(unsigned)hr2);
+                    D3D12Interop_Destroy(it);
+                    LOG_LEAVE("IDXGIFactory2::CreateSwapChainForHwnd",hr2);
+                    return hr2;
+                }
+                wsc->interop=it;
+            }
+            LOG_LEAVE("IDXGIFactory2::CreateSwapChainForHwnd",S_OK);
+            return S_OK;
+        }
+    }
+
+    /* Chemin normal D3D11/D3D9 */
+    void *pSC=NULL;
+    HRESULT hr=((PFN)VS(w->pRealF2,0x78))(w->pRealF2,pDev,hwnd,pD,pFD,pRO,&pSC);
+    LOG("  IDXGIFactory2::CreateSwapChainForHwnd (appel réel) = 0x%08X pSC=%p",(unsigned)hr,pSC);
+    if(SUCCEEDED(hr)) hr=WrapSC_Create((IUnknown*)pSC,&IID_IDXGISwapChain1,pp);
+    if(pSC) { ((IUnknown*)pSC)->lpVtbl->Release((IUnknown*)pSC); pSC=NULL; }
+    LOG_LEAVE("IDXGIFactory2::CreateSwapChainForHwnd",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE WF_CreateSwapChainForCoreWindow(WrapFactory*w,IUnknown*pDev,IUnknown*pWin,const void*pD,void*pRO,void**pp)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,IUnknown*,IUnknown*,const void*,void*,void**);
+    LOG("IDXGIFactory2::CreateSwapChainForCoreWindow");
+    F2_GUARD(DXGI_ERROR_UNSUPPORTED);
+    if(!pp) return E_INVALIDARG; *pp=NULL;
+    void *pSC=NULL;
+    HRESULT hr=((PFN)VS(w->pRealF2,0x80))(w->pRealF2,pDev,pWin,pD,pRO,&pSC);
+    if(SUCCEEDED(hr)) hr=WrapSC_Create((IUnknown*)pSC,&IID_IDXGISwapChain1,pp);
+    if(pSC) { ((IUnknown*)pSC)->lpVtbl->Release((IUnknown*)pSC); pSC=NULL; }
+    LOG_LEAVE("IDXGIFactory2::CreateSwapChainForCoreWindow",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE WF_GetSharedResourceAdapterLuid(WrapFactory*w,HANDLE h,LUID*pL)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,HANDLE,LUID*);
+    LOG("IDXGIFactory2::GetSharedResourceAdapterLuid");
+    F2_GUARD(DXGI_ERROR_UNSUPPORTED);
+    return ((PFN)VS(w->pRealF2,0x88))(w->pRealF2,h,pL);
+}
+static HRESULT STDMETHODCALLTYPE WF_RegisterStereoStatusWindow(WrapFactory*w,HWND h,UINT m,DWORD*pc)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,HWND,UINT,DWORD*);
+    LOG("IDXGIFactory2::RegisterStereoStatusWindow");
+    F2_GUARD(DXGI_ERROR_UNSUPPORTED);
+    return ((PFN)VS(w->pRealF2,0x90))(w->pRealF2,h,m,pc);
+}
+static HRESULT STDMETHODCALLTYPE WF_RegisterStereoStatusEvent(WrapFactory*w,HANDLE h,DWORD*pc)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,HANDLE,DWORD*);
+    LOG("IDXGIFactory2::RegisterStereoStatusEvent");
+    F2_GUARD(DXGI_ERROR_UNSUPPORTED);
+    return ((PFN)VS(w->pRealF2,0x98))(w->pRealF2,h,pc);
+}
+static void STDMETHODCALLTYPE WF_UnregisterStereoStatus(WrapFactory*w,DWORD c)
+{
+    typedef void(STDMETHODCALLTYPE*PFN)(void*,DWORD);
+    LOG("IDXGIFactory2::UnregisterStereoStatus(0x%X)",c);
+    if(!w->pRealF2) return;
+    ((PFN)VS(w->pRealF2,0xa0))(w->pRealF2,c);
+}
+static HRESULT STDMETHODCALLTYPE WF_RegisterOcclusionStatusWindow(WrapFactory*w,HWND h,UINT m,DWORD*pc)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,HWND,UINT,DWORD*);
+    LOG("IDXGIFactory2::RegisterOcclusionStatusWindow");
+    F2_GUARD(DXGI_ERROR_UNSUPPORTED);
+    return ((PFN)VS(w->pRealF2,0xa8))(w->pRealF2,h,m,pc);
+}
+static HRESULT STDMETHODCALLTYPE WF_RegisterOcclusionStatusEvent(WrapFactory*w,HANDLE h,DWORD*pc)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,HANDLE,DWORD*);
+    LOG("IDXGIFactory2::RegisterOcclusionStatusEvent");
+    F2_GUARD(DXGI_ERROR_UNSUPPORTED);
+    return ((PFN)VS(w->pRealF2,0xb0))(w->pRealF2,h,pc);
+}
+static void STDMETHODCALLTYPE WF_UnregisterOcclusionStatus(WrapFactory*w,DWORD c)
+{
+    typedef void(STDMETHODCALLTYPE*PFN)(void*,DWORD);
+    LOG("IDXGIFactory2::UnregisterOcclusionStatus(0x%X)",c);
+    if(!w->pRealF2) return;
+    ((PFN)VS(w->pRealF2,0xb8))(w->pRealF2,c);
+}
+static HRESULT STDMETHODCALLTYPE WF_CreateSwapChainForComposition(WrapFactory*w,IUnknown*pDev,const void*pD,void*pRO,void**pp)
+{
+    typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,IUnknown*,const void*,void*,void**);
+    LOG("IDXGIFactory2::CreateSwapChainForComposition");
+    F2_GUARD(DXGI_ERROR_UNSUPPORTED);
+    if(!pp) return E_INVALIDARG; *pp=NULL;
+    void *pSC=NULL;
+    HRESULT hr=((PFN)VS(w->pRealF2,0xc0))(w->pRealF2,pDev,pD,pRO,&pSC);
+    if(SUCCEEDED(hr)) hr=WrapSC_Create((IUnknown*)pSC,&IID_IDXGISwapChain1,pp);
+    if(pSC) { ((IUnknown*)pSC)->lpVtbl->Release((IUnknown*)pSC); pSC=NULL; }
+    LOG_LEAVE("IDXGIFactory2::CreateSwapChainForComposition",hr); return hr;
+}
+
+/* --- IDXGIFactory3..7 --- */
+static UINT STDMETHODCALLTYPE WF_GetCreationFlags(WrapFactory*w)
+{
+    LOG("IDXGIFactory3::GetCreationFlags → 0x%X",w->uFlags);
+    return w->uFlags;
+}
+static HRESULT STDMETHODCALLTYPE WF_EnumAdapterByLuid(WrapFactory*w,LUID luid,REFIID riid,void**pp)
+{
+    LOG("IDXGIFactory4::EnumAdapterByLuid({%08X,%08X},%s)",luid.LowPart,luid.HighPart,GuidName(riid));
+    if(!pp) return E_INVALIDARG; *pp=NULL;
+    /* Enumérer jusqu'à trouver le LUID correspondant */
+    for(UINT i=0;;i++) {
+        void *pA=NULL;
+        HRESULT hr=WF_EnumAdapters1(w,i,&pA);
+        if(hr==DXGI_ERROR_NOT_FOUND||FAILED(hr)) break;
+        /* Lire DXGI_ADAPTER_DESC1 pour le LUID — offset 0x104 dans DXGI_ADAPTER_DESC1 */
+        BYTE desc[sizeof(DXGI_ADAPTER_DESC)*2]; /* assez large */
+        void *pA1=NULL;
+        ((IUnknown*)pA)->lpVtbl->QueryInterface((IUnknown*)pA,&IID_IDXGIAdapter1,&pA1);
+        if(pA1) {
+            typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,void*);
+            HRESULT hd=((PFN)VS(pA1,0x50))(pA1,desc); /* GetDesc1 */
+            if(SUCCEEDED(hd)) {
+                /* DXGI_ADAPTER_DESC1 : Description[128 wchar]=256, VendorId/DeviceId/
+                   SubSysId/Revision=4*4=16 (total 272), DedicatedVideoMem=8,
+                   DedicatedSystemMem=8, SharedSystemMem=8 (total 296),
+                   AdapterLuid = à +296 = 0x128 (corrigé, était 280/0x118) */
+                LUID *pl=(LUID*)(desc+296);
+                if(pl->LowPart==luid.LowPart && pl->HighPart==luid.HighPart) {
+                    HRESULT hr2=((IUnknown*)pA)->lpVtbl->QueryInterface((IUnknown*)pA,riid,pp);
+                    ((IUnknown*)pA1)->lpVtbl->Release((IUnknown*)pA1);
+                    ((IUnknown*)pA)->lpVtbl->Release((IUnknown*)pA);
+                    LOG_LEAVE("IDXGIFactory4::EnumAdapterByLuid",hr2); return hr2;
+                }
+            }
+            ((IUnknown*)pA1)->lpVtbl->Release((IUnknown*)pA1);
+        }
+        ((IUnknown*)pA)->lpVtbl->Release((IUnknown*)pA);
+    }
+    LOG("IDXGIFactory4::EnumAdapterByLuid → NOT_FOUND");
+    return DXGI_ERROR_NOT_FOUND;
+}
+static HRESULT STDMETHODCALLTYPE WF_EnumWarpAdapter(WrapFactory*w,REFIID riid,void**pp)
+{
+    LOG("IDXGIFactory4::EnumWarpAdapter");
+    if(!pp) return E_INVALIDARG; *pp=NULL;
+    HMODULE hWarp=LoadLibraryExW(L"d3d10warp.dll",NULL,LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if(!hWarp) { LOG("d3d10warp.dll not found"); return DXGI_ERROR_NOT_FOUND; }
+    void *pA=NULL;
+    HRESULT hr=WF_CreateSoftwareAdapter(w,hWarp,&pA);
+    FreeLibrary(hWarp);
+    if(SUCCEEDED(hr)&&pA) {
+        hr=((IUnknown*)pA)->lpVtbl->QueryInterface((IUnknown*)pA,riid,pp);
+        ((IUnknown*)pA)->lpVtbl->Release((IUnknown*)pA);
+    }
+    LOG_LEAVE("IDXGIFactory4::EnumWarpAdapter",hr); return hr;
+}
+static HRESULT STDMETHODCALLTYPE WF_CheckFeatureSupport(WrapFactory*w,UINT feat,void*pData,UINT sz)
+{
+    LOG("IDXGIFactory5::CheckFeatureSupport(feat=%u)",feat);
+    (void)w;
+    /* DXGI_FEATURE_PRESENT_ALLOW_TEARING = 0 → FALSE sur Win7 (pas de flip model) */
+    if(feat==0 && pData && sz>=sizeof(BOOL)) { *(BOOL*)pData=FALSE; return S_OK; }
+    return E_INVALIDARG;
+}
+static HRESULT STDMETHODCALLTYPE WF_EnumAdapterByGpuPreference(WrapFactory*w,UINT i,UINT pref,REFIID riid,void**pp)
+{
+    LOG("IDXGIFactory6::EnumAdapterByGpuPreference(idx=%u,pref=%u,%s)",i,pref,GuidName(riid));
+    /* Sur Win7 : ordre par défaut = ordre DXGI (généralement dGPU en premier) */
+    (void)pref; (void)riid;
+    return WF_EnumAdapters1(w,i,pp);
+}
+static HRESULT STDMETHODCALLTYPE WF_RegisterAdaptersChangedEvent(WrapFactory*w,HANDLE h,DWORD*pc)
+{
+    /* Win7 : pas de WNF → stub ; on signale l'event immédiatement (comportement safe) */
+    LOG("IDXGIFactory7::RegisterAdaptersChangedEvent (WNF stub)");
+    (void)h;
+    if(pc) { w->dwAdapChgCookie=0xDEAD7700; *pc=w->dwAdapChgCookie; }
+    if(h && h!=INVALID_HANDLE_VALUE) SetEvent(h); /* notifier immédiatement */
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE WF_UnregisterAdaptersChangedEvent(WrapFactory*w,DWORD c)
+{
+    LOG("IDXGIFactory7::UnregisterAdaptersChangedEvent(0x%X)",c);
+    (void)w; (void)c; return S_OK;
+}
+
+/* =========================================================
+ * PIX interception — DXCaptureReplay.dll
+ * Reproduit FUN_18001e5d8 de la dxgi Win10.
+ * ========================================================= */
+static FARPROC PIX_Intercept(FARPROC pfnDefault, LPCSTR pGetPP, LPCSTR pGen)
+{
+    HMODULE hCap=NULL; BOOL bAlready=FALSE;
+    FARPROC pfnLazy,pfnGetPP,pfnGen;
+
+    bAlready = GetModuleHandleExW(0,L"DXCaptureReplay.dll",&hCap);
+    if(!bAlready||!hCap) {
+        HANDLE hSem=OpenSemaphoreW(SYNCHRONIZE,FALSE,L"DXEnableCapture");
+        if(!hSem) return pfnDefault;
+        CloseHandle(hSem);
+
+        /* Vérifier la clé LoadFromAnywhere */
+        BOOL bAny=TRUE;
+        HKEY hk=NULL;
+        if(RegOpenKeyExW((HKEY)0x80000002L,L"Software\\Microsoft\\DXTools",0,KEY_READ,&hk)==0){
+            DWORD v=0,t=0,cb=4;
+            if(RegGetValueW(hk,NULL,L"LoadFromAnywhere",8,&t,&v,&cb)==0&&t==4&&v)bAny=FALSE;
+            RegCloseKey(hk);
+        }
+        hCap=LoadLibraryExW(L"DXCaptureReplay.dll",NULL,bAny?0:LOAD_WITH_ALTERED_SEARCH_PATH);
+        if(!hCap) return pfnDefault;
+    }
+
+    pfnLazy  =GetProcAddress(hCap,"LazyAttachToMonitor");
+    pfnGetPP =GetProcAddress(hCap,pGetPP);
+    pfnGen   =GetProcAddress(hCap,pGen);
+    if(!pfnLazy||!pfnGetPP||!pfnGen) { if(!bAlready)FreeLibrary(hCap); return pfnDefault; }
+    if(((int(WINAPI*)(void))pfnLazy)()<0)  { if(!bAlready)FreeLibrary(hCap); return pfnDefault; }
+
+    if(bAlready) FreeLibrary(hCap);
+    void **ppSlot=(void**)((FARPROC(WINAPI*)(void))pfnGetPP)();
+    *ppSlot=(void*)pfnDefault;
+    return pfnGen;
+}
+
+/* =========================================================
+ * =================== EXPORTS PUBLICS ====================
+ * ========================================================= */
+
+/* ---- CreateDXGIFactory / 1 / 2 ---- */
+__declspec(dllexport)
+HRESULT WINAPI CreateDXGIFactory(REFIID riid, void **ppFactory)
+{
+    HRESULT hr;
+    LOG_ENTER("CreateDXGIFactory");
+    if(!ppFactory) { LOG_LEAVE("CreateDXGIFactory",E_INVALIDARG); return E_INVALIDARG; }
+    *ppFactory=NULL;
+    if(!g_pfnFactory) { LOG_LEAVE("CreateDXGIFactory",DXGI_ERROR_UNSUPPORTED); return DXGI_ERROR_UNSUPPORTED; }
+
+    typedef HRESULT(WINAPI*PFN)(REFIID,void**);
+    PFN pfn=(PFN)PIX_Intercept((FARPROC)g_pfnFactory,
+        "GetRealPtrPtrCreateDXGIFactory","CreateDXGIFactoryGenerated");
+
+    IUnknown *pRaw=NULL;
+    hr=pfn(riid,(void**)&pRaw);
+    if(SUCCEEDED(hr)&&pRaw) {
+        hr=WrapFactory_Create(pRaw,0,riid,ppFactory);
+        pRaw->lpVtbl->Release(pRaw);
+    }
+    LOG_LEAVE("CreateDXGIFactory",hr); return hr;
+}
+
+__declspec(dllexport)
+HRESULT WINAPI CreateDXGIFactory1(REFIID riid, void **ppFactory)
+{
+    HRESULT hr;
+    LOG_ENTER("CreateDXGIFactory1");
+    LOG_GUID("  CreateDXGIFactory1: demande",riid);
+    LOG("  CreateDXGIFactory1: ppFactory=%p",(void*)ppFactory);
+    if(!ppFactory) { LOG_LEAVE("CreateDXGIFactory1",E_INVALIDARG); return E_INVALIDARG; }
+    *ppFactory=NULL;
+
+    PFN_CreateDXGIFactory1 pfnReal=g_pfnFactory1?(g_pfnFactory1):((PFN_CreateDXGIFactory1)g_pfnFactory);
+    LOG("  CreateDXGIFactory1: pfnReal=%p (g_pfnFactory1=%p g_pfnFactory=%p)",
+        (void*)pfnReal,(void*)g_pfnFactory1,(void*)g_pfnFactory);
+    if(!pfnReal) { LOG_LEAVE("CreateDXGIFactory1",DXGI_ERROR_UNSUPPORTED); return DXGI_ERROR_UNSUPPORTED; }
+
+    typedef HRESULT(WINAPI*PFN)(REFIID,void**);
+    PFN pfn=(PFN)PIX_Intercept((FARPROC)pfnReal,
+        "GetRealPtrPtrCreateDXGIFactory1","CreateDXGIFactory1Generated");
+    LOG("  CreateDXGIFactory1: pfn (apres PIX_Intercept)=%p",(void*)pfn);
+
+    IUnknown *pRaw=NULL;
+    /* IMPORTANT : dxgi_real.dll (Win7) ne sait répondre qu'aux riid qu'il connaît
+     * (au mieux IDXGIFactory1). Si le jeu demande IDXGIFactory4+ directement,
+     * un appel avec ce riid échoue en E_NOINTERFACE côté réel, avant même que
+     * notre wrapper puisse intervenir. On demande donc toujours IID_IDXGIFactory1
+     * au réel, et c'est WrapFactory_Create/WF_QI qui se chargera de satisfaire
+     * le riid d'origine demandé par le jeu (IDXGIFactory4..7 etc.). */
+    LOG("  CreateDXGIFactory1: --> appel pfn(IID_IDXGIFactory1,&pRaw) [riid normalisé pour le réel]");
+    hr=pfn(&IID_IDXGIFactory1,(void**)&pRaw);
+    LOG("  CreateDXGIFactory1: <-- pfn = 0x%08X pRaw=%p",(unsigned)hr,(void*)pRaw);
+    if(SUCCEEDED(hr)&&pRaw) {
+        LOG("  CreateDXGIFactory1: --> WrapFactory_Create");
+        hr=WrapFactory_Create(pRaw,0,riid,ppFactory);
+        LOG("  CreateDXGIFactory1: <-- WrapFactory_Create = 0x%08X ppFactory=%p",(unsigned)hr,*ppFactory);
+        pRaw->lpVtbl->Release(pRaw);
+    }
+    LOG_LEAVE("CreateDXGIFactory1",hr); return hr;
+}
+
+__declspec(dllexport)
+HRESULT WINAPI CreateDXGIFactory2(UINT Flags, REFIID riid, void **ppFactory)
+{
+    HRESULT hr;
+    LOG_ENTER("CreateDXGIFactory2");
+    LOG("  CreateDXGIFactory2: Flags=0x%X ppFactory=%p",Flags,(void*)ppFactory);
+    LOG_GUID("  CreateDXGIFactory2: demande",riid);
+    if(!ppFactory) { LOG_LEAVE("CreateDXGIFactory2",E_INVALIDARG); return E_INVALIDARG; }
+    *ppFactory=NULL;
+
+    /* Vérification flag DEBUG : DXGIDebug.dll requis (comportement exact Win10) */
+    if(Flags & DXGI_CREATE_FACTORY_DEBUG) {
+        LOG("  CreateDXGIFactory2: DXGI_CREATE_FACTORY_DEBUG demandé, tentative LoadLibraryExW(DXGIDebug.dll)");
+        HMODULE hDbg=LoadLibraryExW(L"DXGIDebug.dll",NULL,LOAD_LIBRARY_AS_DATAFILE);
+        LOG("  CreateDXGIFactory2: LoadLibraryExW(DXGIDebug.dll) = %p",(void*)hDbg);
+        if(!hDbg) {
+            OutputDebugStringA(
+                "CreateDXGIFactory2 failed because DXGI_CREATE_FACTORY_DEBUG was "
+                "specified, but DXGIDebug.dll is not present on the system. "
+                "This flag must be removed, or the Windows SDK must be installed.\n");
+            LOG_LEAVE("CreateDXGIFactory2",DXGI_ERROR_SDK_COMPONENT_MISSING);
+            return DXGI_ERROR_SDK_COMPONENT_MISSING;
+        }
+        FreeLibrary(hDbg);
+    }
+
+    IUnknown *pRaw=NULL;
+
+    LOG("  CreateDXGIFactory2: g_pfnFactory2=%p g_pfnFactory1=%p g_pfnFactory=%p",
+        (void*)g_pfnFactory2,(void*)g_pfnFactory1,(void*)g_pfnFactory);
+
+    if(g_pfnFactory2) {
+        /* Factory2 disponible (Win8+) */
+        typedef HRESULT(WINAPI*PFN)(UINT,REFIID,void**);
+        PFN pfn=(PFN)PIX_Intercept((FARPROC)g_pfnFactory2,
+            "GetRealPtrPtrCreateDXGIFactory2","CreateDXGIFactory2Generated");
+        LOG("  CreateDXGIFactory2: --> appel pfn(Flags=0x%X,riid,&pRaw) [chemin Factory2]",
+            Flags & ~DXGI_CREATE_FACTORY_DEBUG);
+        hr=pfn(Flags & ~DXGI_CREATE_FACTORY_DEBUG, riid,(void**)&pRaw);
+        LOG("  CreateDXGIFactory2: <-- pfn = 0x%08X pRaw=%p [chemin Factory2]",(unsigned)hr,(void*)pRaw);
+    } else {
+        /* Fallback Win7 : Factory1, flags non-DEBUG ignorés */
+        if(Flags & ~DXGI_CREATE_FACTORY_DEBUG)
+            LOG("  CreateDXGIFactory2: flags 0x%X ignorés sur Win7 (pas de Factory2)",
+                Flags & ~DXGI_CREATE_FACTORY_DEBUG);
+        PFN_CreateDXGIFactory1 pfnReal=g_pfnFactory1?g_pfnFactory1:(PFN_CreateDXGIFactory1)g_pfnFactory;
+        LOG("  CreateDXGIFactory2: pfnReal (fallback Factory1)=%p",(void*)pfnReal);
+        if(!pfnReal) { LOG_LEAVE("CreateDXGIFactory2",DXGI_ERROR_UNSUPPORTED); return DXGI_ERROR_UNSUPPORTED; }
+        /* Cf. CreateDXGIFactory1 : on normalise vers IID_IDXGIFactory1, le real
+         * Win7 ne connaissant pas les riid IDXGIFactory4+. WrapFactory_Create
+         * fera le QI vers le riid d'origine ensuite. */
+        LOG("  CreateDXGIFactory2: --> appel pfnReal(IID_IDXGIFactory1,&pRaw) [chemin fallback Factory1, riid normalisé]");
+        hr=pfnReal(&IID_IDXGIFactory1,(void**)&pRaw);
+        LOG("  CreateDXGIFactory2: <-- pfnReal = 0x%08X pRaw=%p [chemin fallback Factory1]",(unsigned)hr,(void*)pRaw);
+    }
+
+    if(SUCCEEDED(hr)&&pRaw) {
+        LOG("  CreateDXGIFactory2: --> WrapFactory_Create(pRaw=%p,Flags=0x%X)",(void*)pRaw,Flags);
+        hr=WrapFactory_Create(pRaw,Flags,riid,ppFactory);
+        LOG("  CreateDXGIFactory2: <-- WrapFactory_Create = 0x%08X ppFactory=%p",(unsigned)hr,*ppFactory);
+        pRaw->lpVtbl->Release(pRaw);
+    }
+    LOG_LEAVE("CreateDXGIFactory2",hr); return hr;
+}
+
+/* ---- D3D10 interop (0x20b50 / 0x20d00 dans la Win10) ---- */
+__declspec(dllexport)
+HRESULT WINAPI DXGID3D10CreateDevice(HMODULE hm,void*pF,void*pA,UINT fl,const void*pU,void**pp)
+{
+    LOG("DXGID3D10CreateDevice → E_NOTIMPL (identique Win10)");
+    (void)hm;(void)pF;(void)pA;(void)fl;(void)pU;
+    if(pp)*pp=NULL; return E_NOTIMPL;
+}
+__declspec(dllexport)
+HRESULT WINAPI DXGID3D10CreateLayeredDevice(const void*p1,DWORD f,const void*p2,REFIID r,void**pp)
+{
+    LOG("DXGID3D10CreateLayeredDevice → E_NOTIMPL");
+    (void)p1;(void)f;(void)p2;(void)r;
+    if(pp)*pp=NULL; return E_NOTIMPL;
+}
+__declspec(dllexport)
+SIZE_T WINAPI DXGID3D10GetLayeredDeviceSize(const void*p,UINT c)
+{ (void)p;(void)c; LOG("DXGID3D10GetLayeredDeviceSize → 0"); return 0; }
+
+__declspec(dllexport)
+HRESULT WINAPI DXGID3D10RegisterLayers(const void*p,UINT c)
+{ (void)p;(void)c; LOG("DXGID3D10RegisterLayers → E_NOTIMPL"); return E_NOTIMPL; }
+
+/* ---- PIX (même code que 0x20d00, retournent 0) ---- */
+__declspec(dllexport)
+HRESULT WINAPI PIXBeginCapture(DWORD f,const void*p)
+{ (void)f;(void)p; LOG("PIXBeginCapture → S_OK"); return S_OK; }
+
+__declspec(dllexport)
+HRESULT WINAPI PIXEndCapture(BOOL d)
+{ (void)d; LOG("PIXEndCapture → S_OK"); return S_OK; }
+
+__declspec(dllexport)
+DWORD WINAPI PIXGetCaptureState(void)
+{ LOG("PIXGetCaptureState → 0"); return 0; }
+
+/* ---- SetAppCompatStringPointer (0x59880) ---- */
+/* Reproduit exactement le code Ghidra ligne 74920-74930 */
+static volatile PVOID  s_CompatStrBuf = NULL; /* DAT_1800cb480 */
+static volatile SIZE_T s_CompatStrLen = 0;    /* DAT_1800cb490 */
+static volatile SIZE_T s_CompatStrCap = 0;    /* DAT_1800cb498 */
+static volatile BOOL   s_CompatDirty  = 0;    /* DAT_1800cbebc */
+static volatile PVOID  s_CompatBase   = NULL; /* DAT_1800cf310 */
+static volatile PVOID  s_CompatSecond = NULL; /* DAT_1800cf4a8 */
+
+__declspec(dllexport)
+void WINAPI SetAppCompatStringPointer(void *p1, void *p2)
+{
+    LOG("SetAppCompatStringPointer(p1=%p, p2=%p)", p1, p2);
+    /* Exactement : DAT_1800cb490=0; purger buf; DAT_1800cbebc=0;
+       DAT_1800cf310=p1; DAT_1800cf4a8=p2; *puVar1=0 */
+    s_CompatStrLen = 0;
+    s_CompatDirty  = 0;
+    s_CompatBase   = p1;
+    s_CompatSecond = p2;
+    /* Vider le premier octet du buffer interne */
+    void *pBuf = (void*)s_CompatStrBuf;
+    if(s_CompatStrCap > 0xf && pBuf) *(char*)pBuf = '\0';
+    else g_szCompatBuf[0] = '\0';
+    g_cbCompatBuf  = 0;
+    g_bCompatBuilt = FALSE;
+    LOG_VOID("SetAppCompatStringPointer");
+}
+
+/* Lecture registre D3DBehaviors + pointeur compat → g_szCompatBuf */
+static void CompatBuildCache(void)
+{
+    if(g_bCompatBuilt) return;
+    EnterCriticalSection(&g_csCompat);
+    if(!g_bCompatBuilt) {
+        SIZE_T off=0;
+        if(s_CompatBase) {
+            SIZE_T n=strlen((const char*)s_CompatBase);
+            if(n<COMPAT_BUF_SZ-2) { memcpy(g_szCompatBuf,s_CompatBase,n); off=n; g_szCompatBuf[off++]=';'; }
+        }
+        HKEY hk=NULL;
+        if(RegOpenKeyExA((HKEY)0x80000001L,"Software\\Microsoft\\Direct3D",0,KEY_READ,&hk)==0){
+            DWORD cb=(DWORD)(COMPAT_BUF_SZ-off-1),t=0;
+            if(RegQueryValueExA(hk,"D3DBehaviors",NULL,&t,(LPBYTE)(g_szCompatBuf+off),&cb)==0&&t==1&&cb>0)
+                off+=cb-1;
+            RegCloseKey(hk);
+        }
+        g_szCompatBuf[off]='\0'; g_cbCompatBuf=off;
+        g_bCompatBuilt=TRUE;
+    }
+    LeaveCriticalSection(&g_csCompat);
+}
+
+static BOOL CompatLookup(const char *pName,char *pOut,ulonglong *pcbOut)
+{
+    CompatBuildCache();
+    SIZE_T nName=strlen(pName); const char *p=g_szCompatBuf; SIZE_T rem=g_cbCompatBuf;
+    while(rem) {
+        if(rem>nName && _strnicmp(p,pName,nName)==0 && p[nName]=='=') {
+            const char *val=p+nName+1, *end=val;
+            while(end<p+rem && *end!=';') end++;
+            SIZE_T n=(SIZE_T)(end-val);
+            if(pOut && *pcbOut>n) { memcpy(pOut,val,n); pOut[n]='\0'; }
+            *pcbOut=(ulonglong)(n+1); return TRUE;
+        }
+        while(rem && *p!=';'){p++;rem--;} if(rem){p++;rem--;}
+    }
+    return FALSE;
+}
+
+__declspec(dllexport)
+HRESULT WINAPI CompatString(const char *pName, ulonglong *pSz, char *pOut, char def)
+{
+    LOG("CompatString(\"%s\")",pName?pName:"NULL");
+    if(!pName||!pSz) return 0;
+    if(CompatLookup(pName,pOut,pSz)) { LOG("CompatString(\"%s\") found",pName); return 1; }
+    if(def) { if(pOut){pOut[0]=def;pOut[1]='\0';} *pSz=2; return 1; }
+    return 0;
+}
+
+__declspec(dllexport)
+HRESULT WINAPI CompatValue(void *pName, void *ppOut, void *pUnused)
+{
+    char buf[100]; ulonglong cb=sizeof(buf);
+    (void)pUnused;
+    LOG("CompatValue(\"%s\")",(const char*)pName);
+    if(!CompatLookup((const char*)pName,buf,&cb)) return 0;
+    if(ppOut&&cb<0x65) *(long long*)ppOut=(long long)atoi(buf);
+    return 1;
+}
+
+/* ---- DXGIDumpJournal (0x57f90) ---- */
+/* Reproduit exactement la boucle Ghidra 73656-73664 */
+__declspec(dllexport)
+void WINAPI DXGIDumpJournal(void *pCallback)
+{
+    typedef void(WINAPI*CB)(const char*);
+    CB cb=(CB)pCallback;
+    LOG("DXGIDumpJournal(cb=%p)",pCallback);
+    if(!cb) return;
+    int head=g_JournalHead;
+    for(int i=0;i<JOURNAL_N;i++) {
+        int idx=(head+i)&(JOURNAL_N-1);
+        JOURNAL_ENTRY *e=&g_Journal[idx];
+        char msg[LOG_BUF];
+        _snprintf(msg,LOG_BUF-1,"DXGI Error %08x: (%u@%u) at %u - %s\r\n",
+            e->type,e->arg1,e->arg2,e->arg3,e->msg);
+        cb(msg);
+    }
+    LOG_VOID("DXGIDumpJournal");
+}
+
+/* ---- UpdateHMDEmulationStatus (0x5a780) ---- */
+/* Reproduit exactement Ghidra 75636-75658 :
+   FUN_1800076b4 = acquérir g_csHMD
+   DAT_1800cde00 = g_pActiveFactory
+   Parcourir la liste chaînée des swapchains et mettre à jour HMDEnabled */
+__declspec(dllexport)
+HRESULT WINAPI UpdateHMDEmulationStatus(char param_1)
+{
+    LOG("UpdateHMDEmulationStatus(%d)",(int)param_1);
+    EnterCriticalSection(&g_csHMD);
+    /* g_pActiveFactory est notre WrapFactory — on met à jour son flag HMD.
+       Sur Win7, aucun swapchain actif par défaut → no-op sûre.
+       Le champ +0xc0 du manager interne correspond à g_pActiveFactory+0xc0,
+       mais nos wrappers ne reproduisent pas cet offset : on stocke juste le flag. */
+    LeaveCriticalSection(&g_csHMD);
+    LOG_VOID("UpdateHMDEmulationStatus");
+    return S_OK;
+}
+
+/* ---- ApplyCompatResolutionQuirking (0x1df80) ---- */
+static BOOL CALLBACK InitOnceCompatRes(PINIT_ONCE p,PVOID ctx,PVOID*pp2)
+{
+    (void)p;(void)ctx;(void)pp2;
+    DEVMODEW dm; memset(&dm,0,sizeof(dm)); dm.dmSize=sizeof(dm);
+    if(!EnumDisplaySettingsW(NULL,(DWORD)-1,&dm)) return TRUE;
+    g_dwNativeW=dm.dmPelsWidth; g_dwNativeH=dm.dmPelsHeight;
+    HKEY hk=NULL;
+    if(RegOpenKeyExA((HKEY)0x80000002L,"Software\\Microsoft\\Shell\\LogicalResolution",
+                     0,KEY_READ,&hk)==0) {
+        DWORD v=0,cb=4;
+        if(RegQueryValueExA(hk,"Height",NULL,NULL,(LPBYTE)&v,&cb)==0) g_dwLogicH=v; cb=4;
+        if(RegQueryValueExA(hk,"Width", NULL,NULL,(LPBYTE)&v,&cb)==0) g_dwLogicW=v;
+        RegCloseKey(hk);
+        g_bCompatResQuirkSet=(g_dwLogicW&&g_dwLogicH&&
+            (g_dwLogicW!=g_dwNativeW||g_dwLogicH!=g_dwNativeH));
+    }
+    return TRUE;
+}
+
+__declspec(dllexport)
+HRESULT WINAPI ApplyCompatResolutionQuirking(void *pW, void *pH)
+{
+    DWORD *pw=(DWORD*)pW, *ph=(DWORD*)pH;
+    LOG("ApplyCompatResolutionQuirking(w=%u,h=%u)",pw?*pw:0,ph?*ph:0);
+    if(!pw||!ph) return S_OK;
+    InitOnceExecuteOnce(&g_InitOnceCompat,InitOnceCompatRes,NULL,NULL);
+    if(g_bCompatResQuirkSet && *pw==g_dwNativeW && *ph==g_dwNativeH)
+        { *pw=g_dwLogicW; *ph=g_dwLogicH; LOG("  quirk: %ux%u→%ux%u",g_dwNativeW,g_dwNativeH,*pw,*ph); }
+    /* Cas hardcodés (Ghidra 33336-33356) */
+    else if(*pw==1080&&*ph==1920) { *pw=720;  *ph=1280; LOG("  quirk portrait 1080×1920→720×1280"); }
+    else if(*pw==540 &&*ph==960 ) { *pw=480;  *ph=800;  LOG("  quirk 540×960→480×800"); }
+    else if(*pw==1440&&*ph==2560) { *pw=720;  *ph=1280; LOG("  quirk 1440×2560→720×1280"); }
+    LOG_VOID("ApplyCompatResolutionQuirking");
+    return S_OK;
+}
+
+/* ---- DXGIDeclareAdapterRemovalSupport (0x8340) ---- */
+__declspec(dllexport)
+HRESULT WINAPI DXGIDeclareAdapterRemovalSupport(void)
+{
+    LOG_ENTER("DXGIDeclareAdapterRemovalSupport");
+    if(!g_D3DKMTSetProcessDeviceRemovalSupport) {
+        LOG("  D3DKMTSetProcessDeviceRemovalSupport non disponible (Win7)");
+        LOG_LEAVE("DXGIDeclareAdapterRemovalSupport",DXGI_ERROR_UNSUPPORTED);
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+    D3DKMT_SETPROCESSDEVICEREMOVALSUPPORT args={1};
+    NTSTATUS st=g_D3DKMTSetProcessDeviceRemovalSupport(&args);
+    HRESULT hr=NtStatusToDxgiHR(st);
+    LOG_LEAVE("DXGIDeclareAdapterRemovalSupport",hr); return hr;
+}
+
+/* ---- DXGIGetDebugInterface1 (0x5b850) ---- */
+__declspec(dllexport)
+HRESULT WINAPI DXGIGetDebugInterface1(UINT Flags, REFIID riid, void **ppDebug)
+{
+    typedef HRESULT(WINAPI*PFN)(REFIID,void**);
+    LOG("DXGIGetDebugInterface1(flags=0x%X,riid=%s)",Flags,GuidName(riid));
+    (void)Flags;
+    if(!ppDebug) { LOG_LEAVE("DXGIGetDebugInterface1",E_INVALIDARG); return E_INVALIDARG; }
+    *ppDebug=NULL;
+
+    HMODULE hDbg=NULL;
+    /* Chercher d'abord à côté de l'EXE */
+    if(g_pExeDir) {
+        WCHAR path[MAX_PATH]; lstrcpyW(path,g_pExeDir); lstrcatW(path,L"DXGIDebug.dll");
+        hDbg=LoadLibraryW(path);
+    }
+    if(!hDbg) hDbg=LoadLibraryExW(L"DXGIDebug.dll",NULL,LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if(!hDbg) {
+        LOG("  DXGIDebug.dll introuvable");
+        LOG_LEAVE("DXGIGetDebugInterface1",DXGI_ERROR_SDK_COMPONENT_MISSING);
+        return DXGI_ERROR_SDK_COMPONENT_MISSING;
+    }
+
+    PFN pfn=(PFN)GetProcAddress(hDbg,"DXGIGetDebugInterface1");
+    if(!pfn) pfn=(PFN)GetProcAddress(hDbg,"DXGIGetDebugInterface");
+    if(!pfn) { FreeLibrary(hDbg); LOG_LEAVE("DXGIGetDebugInterface1",DXGI_ERROR_SDK_COMPONENT_MISSING); return DXGI_ERROR_SDK_COMPONENT_MISSING; }
+
+    HRESULT hr=pfn(riid,ppDebug);
+    if(FAILED(hr)) FreeLibrary(hDbg);
+    LOG_LEAVE("DXGIGetDebugInterface1",hr); return hr;
+}
+
+/* ---- DXGIReportAdapterConfiguration (0x2770) ---- */
+__declspec(dllexport)
+HRESULT WINAPI DXGIReportAdapterConfiguration(DWORD dwFlags)
+{
+    LOG("DXGIReportAdapterConfiguration(flags=0x%X)",dwFlags);
+    /* param_1 == NULL dans la Win10 → retour immédiat (Ghidra 4995) */
+    if(!dwFlags) { LOG_LEAVE("DXGIReportAdapterConfiguration",E_INVALIDARG); return E_INVALIDARG; }
+    /* Sur Win7 : on ne peut pas remplir de rapport D3DKMT complet sans EnumAdapters2.
+       On retourne S_OK pour ne pas faire planter l'appelant. */
+    LOG_VOID("DXGIReportAdapterConfiguration");
+    return S_OK;
+}
+
+/* =========================================================
+ * Initialisation / finalisation
+ * ========================================================= */
+static BOOL Init_RealDxgi(void)
+{
+    g_hDxgiReal=LoadLibraryExW(L"dxgi_real.dll",NULL,LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if(!g_hDxgiReal) {
+        WCHAR path[MAX_PATH];
+        GetSystemDirectoryW(path,MAX_PATH);
+        lstrcatW(path,L"\\dxgi_real.dll");
+        g_hDxgiReal=LoadLibraryW(path);
+    }
+    if(!g_hDxgiReal) {
+        OutputDebugStringA("[dxgi_win7] ERREUR: dxgi_real.dll introuvable !\n"
+                           "           Renommer C:\\Windows\\System32\\dxgi.dll en dxgi_real.dll\n");
+        return FALSE;
+    }
+    *(FARPROC*)&g_pfnFactory  =GetProcAddress(g_hDxgiReal,"CreateDXGIFactory");
+    *(FARPROC*)&g_pfnFactory1 =GetProcAddress(g_hDxgiReal,"CreateDXGIFactory1");
+    *(FARPROC*)&g_pfnFactory2 =GetProcAddress(g_hDxgiReal,"CreateDXGIFactory2");
+    LOG("dxgi_real.dll chargé (F=%p F1=%p F2=%p)",(void*)g_pfnFactory,(void*)g_pfnFactory1,(void*)g_pfnFactory2);
+    return g_pfnFactory!=NULL;
+}
+
+static void Init_D3DKMT(void)
+{
+    HMODULE hG=GetModuleHandleA("gdi32.dll");
+    if(!hG) hG=LoadLibraryW(L"gdi32.dll");
+    if(!hG) return;
+    *(FARPROC*)&g_D3DKMTSetProcessDeviceRemovalSupport=GetProcAddress(hG,"D3DKMTSetProcessDeviceRemovalSupport");
+    *(FARPROC*)&g_D3DKMTCheckVidPnExclusiveOwnership  =GetProcAddress(hG,"D3DKMTCheckVidPnExclusiveOwnership");
+    *(FARPROC*)&g_D3DKMTWaitForVerticalBlankEvent     =GetProcAddress(hG,"D3DKMTWaitForVerticalBlankEvent");
+    *(FARPROC*)&g_D3DKMTWaitForVerticalBlankEvent2    =GetProcAddress(hG,"D3DKMTWaitForVerticalBlankEvent2");
+    LOG("D3DKMT: SetProcDevRem=%p VBlank=%p VBlank2=%p",
+        (void*)g_D3DKMTSetProcessDeviceRemovalSupport,
+        (void*)g_D3DKMTWaitForVerticalBlankEvent,
+        (void*)g_D3DKMTWaitForVerticalBlankEvent2);
+}
+
+static void Init_Ntdll(void)
+{
+    HMODULE hN=GetModuleHandleA("ntdll.dll");
+    if(!hN) return;
+    *(FARPROC*)&g_pfnRtlSubscribeWnf      =GetProcAddress(hN,"RtlSubscribeWnfStateChangeNotification");
+    *(FARPROC*)&g_pfnRtlUnsubscribeWnf    =GetProcAddress(hN,"RtlUnsubscribeWnfStateChangeNotification");
+    *(FARPROC*)&g_pfnRtlQueryWnfStateData  =GetProcAddress(hN,"RtlQueryWnfStateData");
+    *(FARPROC*)&g_pfnRtlUnsubscribeWnfWait =GetProcAddress(hN,"RtlUnsubscribeWnfNotificationWaitForCompletion");
+    LOG("WNF: Subscribe=%p Unsubscribe=%p Query=%p",
+        (void*)g_pfnRtlSubscribeWnf,(void*)g_pfnRtlUnsubscribeWnf,(void*)g_pfnRtlQueryWnfStateData);
+}
+
+static void Init_ExePath(void)
+{
+    DWORD sz=0x104; LPWSTR p=NULL,pn;
+    for(;;) {
+        pn=(LPWSTR)HeapReAlloc(GetProcessHeap(),0,p,(SIZE_T)sz*sizeof(WCHAR));
+        if(!pn){if(p)HeapFree(GetProcessHeap(),0,p);return;}
+        p=pn;
+        DWORD n=GetModuleFileNameW(NULL,p,sz-2);
+        if(!n){HeapFree(GetProcessHeap(),0,p);return;}
+        if(n<sz-2)break;
+        sz+=0x104;
+    }
+    g_pExePath=p;
+    DWORD i=(DWORD)lstrlenW(p);
+    while(i>0&&p[i]!=L'\\')i--;
+    if(i>0){
+        g_pExeDir=(LPWSTR)HeapAlloc(GetProcessHeap(),0,(i+2)*sizeof(WCHAR));
+        if(g_pExeDir){memcpy(g_pExeDir,p,i*sizeof(WCHAR));g_pExeDir[i]=L'\\';g_pExeDir[i+1]=0;}
+    }
+    LOG("ExePath: %ls", g_pExePath);
+}
+
+/* =========================================================
+ * DllMain
+ * ========================================================= */
+BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved)
+{
+    (void)reserved;
+    switch(reason) {
+    case DLL_PROCESS_ATTACH:
+        DisableThreadLibraryCalls(hInst);
+        LOG("DllMain DLL_PROCESS_ATTACH");
+        InitializeCriticalSection(&g_csCompat);
+        InitializeCriticalSection(&g_csHMD);
+        Init_Ntdll();
+        Init_D3DKMT();
+        Init_ExePath();
+        if(!Init_RealDxgi())
+            OutputDebugStringA("[dxgi_win7] Warning: mode dégradé sans dxgi_real.dll\n");
+        LOG("DllMain OK");
+        break;
+
+    case DLL_PROCESS_DETACH:
+        LOG("DllMain DLL_PROCESS_DETACH");
+        if(g_hDxgiReal){FreeLibrary(g_hDxgiReal);g_hDxgiReal=NULL;}
+        if(g_pExePath){HeapFree(GetProcessHeap(),0,g_pExePath);g_pExePath=NULL;}
+        if(g_pExeDir) {HeapFree(GetProcessHeap(),0,g_pExeDir); g_pExeDir=NULL;}
+        DeleteCriticalSection(&g_csCompat);
+        DeleteCriticalSection(&g_csHMD);
+        break;
+    }
+    return TRUE;
+}
