@@ -1,0 +1,10 @@
+This is the changelog of all versions of this patch
+
+a1.04
+  -Fixed CreateDXGIFactory1
+
+a1.12
+  -Fixed SwapChain + RTVBuffer (kind of)
+
+a1.18
+  -Fixed C5 error in d3d11. Now rendering works with some D3D12 samples. For some of them, the image isn't being drawn into the created window, but the program does actually run
