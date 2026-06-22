@@ -14,3 +14,4 @@ b1.0
 
 b1.02
   -Increased the wrapper compatibility. The AMD DirectX12 (https://github.com/GPUOpen-LibrariesAndSDKs/HelloD3D12) demo now works!
+  -Translated the notes from French to English
