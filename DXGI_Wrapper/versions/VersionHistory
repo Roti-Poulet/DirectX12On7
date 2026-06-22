@@ -15,3 +15,6 @@ b1.0
 b1.02
   -Increased the wrapper compatibility. The AMD DirectX12 (https://github.com/GPUOpen-LibrariesAndSDKs/HelloD3D12) demo now works!
   -Translated the notes and log from French to English
+
+b1.04
+  Added partial support of CreateDXGIFactory2. Some Win32 samples using CreateDXGIFactory2 are now supported
