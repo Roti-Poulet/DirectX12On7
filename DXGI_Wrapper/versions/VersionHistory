@@ -22,3 +22,6 @@ b1.04
 b1.07
   -Increased compatibility with other samples
   -Fixed some other errors with a microsoft sample even if it doesn't make this sample work. Basically Microsoft samples are very complex for no reason and are a pain to fix
+
+b1.08
+  -Fixed resizing a window make it crash
