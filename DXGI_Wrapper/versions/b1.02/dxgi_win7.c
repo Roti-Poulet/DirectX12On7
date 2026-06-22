@@ -1,12 +1,15 @@
 /*
- * dxgi_win7.c — Port de dxgi.dll (Windows 10) pour Windows 7 x64
+ * dxgi_win7.c — DXGI wrapper for Windows 7 x64
  *
- * Compilé avec MinGW64 : x86_64-w64-mingw32-gcc -m64 -shared ...
- * Source unique + dxgi_win7.def
+ * Provides D3D12on7 support via ID3D12CommandQueueDownlevel, allowing
+ * DirectX 12 applications to run on Windows 7.
+ *
+ * Compiled with MinGW64: x86_64-w64-mingw32-gcc -m64 -shared ...
+ * Single source + dxgi_win7.def
  */
 
 /* =========================================================
- * Includes / types de base
+ * Includes / base types
  * ========================================================= */
 #define INITGUID
 
@@ -22,8 +25,8 @@
 #include <stdio.h>
 #include <stdarg.h>
 
-#include <winternl.h>   /* fournit NTSTATUS, PVOID, ULONG, PULONG */
-#include <dxgi1_2.h>     /* fournit DXGI_ADAPTER_DESC, DXGI_ADAPTER_DESC1, et déjà les DXGI_ERROR_* */
+#include <winternl.h>   /* Provides NTSTATUS, PVOID, ULONG, PULONG */
+#include <dxgi1_2.h>    /* Provides DXGI_ADAPTER_DESC, DXGI_ADAPTER_DESC1, and DXGI_ERROR_* */
 
 typedef unsigned char      undefined;
 typedef unsigned char      undefined1;
@@ -37,7 +40,7 @@ typedef unsigned long long ulonglong;
 typedef long long          longlong;
 
 /* =========================================================
- * Définitions D3D11 manquantes (MinGW64 avec _WIN32_WINNT=0x0601)
+ * D3D11 definitions missing from MinGW64 with _WIN32_WINNT=0x0601
  * ========================================================= */
 typedef enum D3D11_MAP {
     D3D11_MAP_READ                 = 1,
@@ -77,7 +80,7 @@ typedef struct D3D11_MAPPED_SUBRESOURCE {
  * ========================================================= */
 #define LOG_BUF 512
 
-/* Offsets vtable D3D12 pour la command list et le downlevel present */
+/* D3D12 vtable offsets for command list and downlevel present */
 #define D3D12_COMMAND_ALLOCATOR_RESET_OFF         0x40   /* ID3D12CommandAllocator::Reset */
 #define D3D12_GRAPHICS_COMMAND_LIST_RESET_OFF     0x50   /* ID3D12GraphicsCommandList::Reset */
 #define D3D12_COMMAND_QUEUE_DOWNLEVEL_PRESENT_OFF 0x18   /* ID3D12CommandQueueDownlevel::Present */
@@ -103,31 +106,21 @@ static void DXGILog(const char *fmt, ...)
     OutputDebugStringA(buf);
 }
 
-/* Macros pratiques */
+/* Convenience macros */
 #define LOG(...)         DXGILog("[dxgi_win7] " __VA_ARGS__)
 #define LOG_ENTER(fn)    DXGILog("[dxgi_win7] --> " fn)
 #define LOG_LEAVE(fn,hr) DXGILog("[dxgi_win7] <-- " fn " = 0x%08X", (unsigned)(hr))
 #define LOG_VOID(fn)     DXGILog("[dxgi_win7] <-- " fn " (void)")
 
 /* =========================================================
- * Émulation SEH (__try/__except) pour MinGW
+ * SEH emulation (__try/__except) for MinGW
  *
- * MinGW-w64 GCC ne supporte PAS la syntaxe __try/__except de Microsoft
- * (extension propriétaire MSVC) — seul le mécanisme SEH64 sous-jacent
- * existe au niveau ABI, mais pas les mots-clés.
- *
- * On émule un comportement équivalent avec AddVectoredExceptionHandler :
- * un handler global temporaire est installé juste avant un appel risqué,
- * et retourne EXCEPTION_CONTINUE_EXECUTION en sautant directement après
- * l'appel via setjmp/longjmp — ce qui permet de "rattraper" l'exception
- * sans laisser planter tout le process, similaire à __except(EXECUTE_HANDLER).
+ * MinGW-w64 GCC does NOT support Microsoft's __try/__except syntax.
+ * We emulate it using AddVectoredExceptionHandler + setjmp/longjmp.
  * ========================================================= */
 #include <setjmp.h>
 
-/* __thread (extension GCC native) plutôt que __declspec(thread) : ce
- * dernier est parfois ignoré par MinGW selon l'ordre des spécificateurs
- * (warning "'thread' attribute directive ignored"), alors que __thread
- * est l'extension TLS native et fiable sur GCC/MinGW. */
+/* __thread (GCC native extension) instead of __declspec(thread) */
 static __thread jmp_buf  g_SehJmpBuf;
 static __thread BOOL     g_SehArmed = FALSE;
 static __thread DWORD    g_SehLastExceptionCode = 0;
@@ -138,10 +131,6 @@ static LONG CALLBACK SehVectoredHandler(EXCEPTION_POINTERS *pInfo)
     if (g_SehArmed) {
         g_SehArmed = FALSE;
         g_SehLastExceptionCode = pInfo->ExceptionRecord->ExceptionCode;
-        /* On ne peut pas reprendre l'exécution au point d'origine de façon
-         * fiable pour toutes les exceptions (notamment ACCESS_VIOLATION),
-         * donc on utilise longjmp pour sortir proprement du bloc protégé
-         * plutôt que EXCEPTION_CONTINUE_EXECUTION. */
         longjmp(g_SehJmpBuf, 1);
     }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -154,21 +143,15 @@ static void SehInit(void)
 }
 
 /*
- * SEH_TRY / SEH_EXCEPT(code_var) — remplace __try { ... } __except(...) { ... }
+ * SEH_TRY / SEH_EXCEPT(code_var) — emulates __try { ... } __except(...) { ... }
  *
- * Usage :
+ * Usage:
  *   DWORD exCode;
  *   SEH_TRY {
- *       ... code risqué ...
+ *       ... risky code ...
  *   } SEH_EXCEPT(exCode) {
- *       ... gestion de l'exception, exCode contient le code ...
+ *       ... exception handling ...
  *   }
- *
- * Limitation connue : contrairement au vrai SEH, les variables locales
- * modifiées DANS le bloc protégé après le point où elles ont été lues par
- * setjmp peuvent ne pas refléter leur dernière valeur après un longjmp, sauf
- * si elles sont déclarées volatile. Pour notre usage (juste vérifier hr et
- * pCmdList après l'appel), on déclare ces variables volatile localement.
  */
 #define SEH_TRY \
     SehInit(); \
@@ -189,7 +172,7 @@ static void SehInit(void)
     }
 
 /* =========================================================
- * HRESULT / erreurs DXGI
+ * HRESULT / DXGI error codes
  * ========================================================= */
 #ifndef S_OK
 #define S_OK ((HRESULT)0)
@@ -213,8 +196,7 @@ static void SehInit(void)
 #define DXGI_CREATE_FACTORY_DEBUG  0x1u
 
 /*
- * NtStatus → HRESULT (FUN_180003614 décompilé de la dxgi Win10)
- * Reproduit à l'identique la table de conversion.
+ * NtStatus to HRESULT conversion
  */
 static HRESULT NtStatusToDxgiHR(NTSTATUS st)
 {
@@ -237,8 +219,8 @@ static HRESULT NtStatusToDxgiHR(NTSTATUS st)
 }
 
 /* =========================================================
- * GUIDs DXGI (publics SDK Microsoft, définis ici pour éviter
- * de dépendre de dxgi.h / initguid.h)
+ * DXGI GUIDs (public Microsoft SDK GUIDs, defined here to
+ * avoid dependency on dxgi.h / initguid.h)
  * ========================================================= */
 #define MAKE_GUID(name,l,w1,w2,b1,b2,b3,b4,b5,b6,b7,b8) \
     static const GUID name = {l,w1,w2,{b1,b2,b3,b4,b5,b6,b7,b8}}
@@ -270,7 +252,7 @@ MAKE_GUID(IID_IDXGIDevice3,      0x6007896C,0x3244,0x4AFD,0xBF,0x18,0xA6,0xD3,0x
 MAKE_GUID(IID_IDXGIDevice4,      0x95B4F95F,0xD8DA,0x4CA4,0x9E,0xE6,0x3B,0x76,0xD5,0x96,0x8A,0x10);
 
 /* =========================================================
- * GUIDs D3D11 / D3D12
+ * D3D11 / D3D12 GUIDs
  * ========================================================= */
 MAKE_GUID(IID_ID3D11Device,        0xDB6F6DDB,0xAC77,0x4E88,0x82,0x53,0x81,0x9D,0xF9,0xBB,0xF1,0x40);
 MAKE_GUID(IID_ID3D11Device1,       0xA04BFB29,0x08EF,0x43D6,0xA4,0x9C,0xA9,0xBD,0xBD,0xCB,0xE6,0x86);
@@ -278,31 +260,14 @@ MAKE_GUID(IID_ID3D11Texture2D,     0x6F15AAF2,0xD208,0x4E89,0x9A,0xB4,0x48,0x95,
 MAKE_GUID(IID_ID3D11Resource,      0xDC8E63F3,0xD12B,0x4952,0xB4,0x7B,0x5E,0x45,0x02,0x6A,0x86,0x2D);
 MAKE_GUID(IID_ID3D12Device,        0x189819F1,0x1DB6,0x4B57,0xBE,0x54,0x18,0x21,0x33,0x9B,0x85,0xF7);
 MAKE_GUID(IID_ID3D12CommandQueue,  0x0EC870A6,0x5D7E,0x4C22,0x8C,0xFC,0x5B,0xAA,0xE0,0x76,0x16,0xED);
-/* D3D12on7 — API officielle Microsoft pour présenter du contenu D3D12 sur
- * Windows 7 (pack Direct3D12Downlevel). C'est LA bonne approche : pas de
- * swapchain DXGI/D3D11, pas de copie cross-API manuelle — le driver gère
- * tout en interne via cette fonction dédiée. */
+/* D3D12on7 — official Microsoft API for presenting D3D12 content on Windows 7
+ * (Direct3D12Downlevel package). */
 MAKE_GUID(IID_ID3D12CommandQueueDownlevel, 0x38A8C5EF,0x7CCB,0x4E81,0x91,0x4F,0xA6,0xE9,0xD0,0x72,0xC4,0x94);
-/* Pas besoin de GUID typés pour ID3D12CommandAllocator/ID3D12GraphicsCommandList :
- * on les crée avec IID_IUnknown_ (déjà défini) et on appelle leurs méthodes
- * par offset vtable brut, comme pour le reste du fichier. Évite de risquer
- * un GUID faux non vérifiable avec certitude. */
 typedef enum { D3D12_DOWNLEVEL_PRESENT_FLAG_NONE_ = 0 } D3D12_DOWNLEVEL_PRESENT_FLAGS_;
 typedef enum { D3D12_COMMAND_LIST_TYPE_DIRECT_ = 0 } D3D12_COMMAND_LIST_TYPE_;
 MAKE_GUID(IID_ID3D12InfoQueue,     0x0742A90B,0xC387,0x483F,0xB9,0x46,0x30,0xA7,0xE4,0xE6,0x14,0x58);
 MAKE_GUID(IID_ID3D12Resource,      0x696442BE,0xA72E,0x4059,0xBC,0x79,0x5B,0x5C,0x98,0x04,0x0F,0xAD);
-/* ID3D12Fence : nécessaire pour synchroniser GPU(D3D12)→CPU avant la copie D3D11 */
 MAKE_GUID(IID_ID3D12Fence,         0x0A753DCF,0xC4D8,0x4B91,0xAD,0xF6,0xBE,0x5A,0x60,0xD9,0x5A,0x76);
-/*
- * IID_ID3D12CommandAllocator / IID_ID3D12GraphicsCommandList — utilisés
- * désormais au lieu de IID_IUnknown_ lors de la création de ces objets.
- * Le pack Direct3D12Downlevel (D3D12on7) sur Win7 semble être un proxy COM
- * moins permissif que le runtime D3D12 natif Win10 : demander explicitement
- * le bon riid lors de CreateCommandAllocator/CreateCommandList garantit que
- * l'objet retourné a une vtable complète et correcte, plutôt que de compter
- * sur le fait qu'IUnknown* pointe "par chance" sur la même vtable complète
- * (qui peut différer sur une implémentation proxy/downlevel).
- */
 MAKE_GUID(IID_ID3D12CommandAllocator,    0x6102DEE4,0xAF59,0x4B09,0xB9,0x99,0xB4,0x4D,0x73,0xF0,0x9B,0x24);
 MAKE_GUID(IID_ID3D12GraphicsCommandList, 0x5B160D0F,0xAC1B,0x4185,0x8B,0xA8,0xB3,0xAE,0x42,0xA5,0xA4,0x55);
 
@@ -342,7 +307,7 @@ typedef struct _D3D11_TEXTURE2D_DESC_MIN {
 } D3D11_TEXTURE2D_DESC_MIN;
 
 /* =========================================================
- * Structures D3D12 minimales
+ * Minimal D3D12 structures
  * ========================================================= */
 typedef enum {
     D3D12_HEAP_TYPE_DEFAULT_  = 1,
@@ -397,11 +362,7 @@ typedef struct _D3D12_RESOURCE_DESC_MIN {
     D3D12_RESOURCE_FLAGS_ Flags;
 } D3D12_RESOURCE_DESC_MIN;
 
-/* ATTENTION : ne pas confondre avec D3D12_RESOURCE_FLAGS_ (qui décrit les
- * capacités d'une ressource, ex: ALLOW_RENDER_TARGET_=0x1). Les
- * RESOURCE_STATES décrivent l'état de transition courant de la ressource
- * et utilisent un jeu de valeurs totalement différent (valeurs réelles du
- * SDK D3D12, cf. d3d12.h / D3D12_RESOURCE_STATES). */
+/* Note: D3D12_RESOURCE_STATES are separate from D3D12_RESOURCE_FLAGS_ */
 typedef enum {
     D3D12_RESOURCE_STATE_COMMON_                 = 0,
     D3D12_RESOURCE_STATE_RENDER_TARGET_          = 0x4,
@@ -410,96 +371,37 @@ typedef enum {
     D3D12_RESOURCE_STATE_COPY_SOURCE_            = 0x800,
 } D3D12_RESOURCE_STATES_;
 
-/* D3D12_CLEAR_VALUE réel est une union {FLOAT Color[4]; D3D12_DEPTH_STENCIL_VALUE
- * DepthStencil;}. Pour un render target, seul Color est utilisé : la
- * version minimale ci-dessous reprend exactement le layout mémoire
- * attendu par CreateCommittedResource (Format puis 4 floats). */
+/* D3D12_CLEAR_VALUE — union of Color[4] and DepthStencil */
 typedef struct _D3D12_CLEAR_VALUE_MIN {
     DXGI_FORMAT Format;
     FLOAT Color[4];
 } D3D12_CLEAR_VALUE_MIN;
 
+/* D3D12 device vtable offsets */
 #define D3D12DEV_OpenSharedHandle_OFF        0x100
-/*
- * CreateFence : offset 0x120 dans la vtable ID3D12Device — vérifié contre
- * le layout exact du SDK (slot 36, après Evict=0x118).
- * ATTENTION : 0xF0 est CreateReservedResource, PAS CreateFence — une
- * confusion à cet offset cause E_INVALIDARG car les signatures diffèrent.
- */
 #define D3D12DEV_CreateFence_OFF             0x120
-/* ID3D12Device::CreateCommandAllocator = slot 9 (après IUnknown(0-2)+
- * ID3D12Object(3-6)+GetNodeCount(7)+CreateCommandQueue(8)) = 0x48 */
 #define D3D12DEV_CreateCommandAllocator_OFF  0x48
-/* ID3D12Device::CreateCommandList = slot 12 (après CreateCommandAllocator(9)+
- * CreateGraphicsPipelineState(10)+CreateComputePipelineState(11)) = 0x60 */
 #define D3D12DEV_CreateCommandList_OFF       0x60
-/* ID3D12Device::CreateCommittedResource = slot 27 (0xD8) sur x64.
- * Layout après CreateCommandList(12=0x60) : CheckFeatureSupport(13=0x68),
- * CreateDescriptorHeap(14=0x70), GetDescriptorHandleIncrementSize(15=0x78),
- * CreateRootSignature(16=0x80), CreateConstantBufferView(17=0x88),
- * CreateShaderResourceView(18=0x90), CreateUnorderedAccessView(19=0x98),
- * CreateRenderTargetView(20=0xA0), CreateDepthStencilView(21=0xA8),
- * CreateSampler(22=0xB0), CopyDescriptors(23=0xB8),
- * CopyDescriptorsSimple(24=0xC0), GetResourceAllocationInfo(25=0xC8/0xD0
- * selon overload — méthode à 2 slots sur ABI x64 cause du retour par
- * valeur de structure >16 bytes), GetCustomHeapProperties(26),
- * CreateCommittedResource(27=0xD8). */
 #define D3D12DEV_CreateCommittedResource_OFF 0xD8
 #define D3D12CQ_GetDevice_OFF   0x38
-/*
- * ID3D12CommandQueue::Signal — offset 0x70 dans la vtable CommandQueue.
- * Layout exact : QI=0x00,AddRef=0x08,Release=0x10,GetPrivateData=0x18,
- * SetPrivateData=0x20,SetPrivateDataInterface=0x28,SetName=0x30,
- * GetDevice=0x38,UpdateTileMappings=0x40,CopyTileMappings=0x48,
- * ExecuteCommandLists=0x50,SetMarker=0x58,BeginEvent=0x60,EndEvent=0x68,
- * Signal=0x70, Wait=0x78.
- */
 #define D3D12CQ_Signal_OFF      0x70
-/* ID3D12Fence::GetCompletedValue = 0x18, SetEventOnCompletion = 0x20
- * (après QI=0x00, AddRef=0x08, Release=0x10) */
-/*
- * ID3D12Fence::GetCompletedValue / SetEventOnCompletion / Signal
- *
- * ATTENTION : ID3D12Fence n'hérite PAS directement de IUnknown !
- * Chaîne d'héritage réelle : ID3D12Fence → ID3D12Pageable →
- * ID3D12DeviceChild → ID3D12Object → IUnknown.
- *
- * ID3D12DeviceChild ajoute GetDevice à l'offset 0x38, ce qui décale
- * TOUTES les méthodes propres à ID3D12Fence de +8 par rapport à un
- * calcul naïf "juste après IUnknown+ID3D12Object".
- *
- * Layout exact (vérifié via le SDK) :
- *   QI=0x00, AddRef=0x08, Release=0x10                    (IUnknown)
- *   GetPrivateData=0x18, SetPrivateData=0x20,
- *   SetPrivateDataInterface=0x28, SetName=0x30             (ID3D12Object)
- *   GetDevice=0x38                                          (ID3D12DeviceChild)
- *   GetCompletedValue=0x40                                  (ID3D12Fence)
- *   SetEventOnCompletion=0x48
- *   Signal=0x50
- *
- * L'ancien offset 0x18 pointait en réalité vers GetPrivateData, qui a une
- * signature complètement différente → on récupérait des données aberrantes
- * dans RAX (d'où completed=2289696770, une valeur sans rapport avec un
- * compteur de fence qui devrait démarrer à 0).
- */
+
+/* ID3D12Fence vtable offsets (inherits from ID3D12DeviceChild) */
 #define D3D12FENCE_GetCompletedValue_OFF     0x40
 #define D3D12FENCE_SetEventOnCompletion_OFF  0x48
 #define D3D12FENCE_Signal_OFF                0x50
 
 
 /* =========================================================
- * Helper de diagnostic vtable : valide un pointeur de fonction avant de
- * l'appeler, et identifie dans quel module il tombe. Permet de distinguer
- * "offset de vtable faux" (ptr garbage / page non-exec / module inattendu)
- * de "offset correct mais l'objet sous-jacent ne supporte pas l'appel".
+ * Diagnostic helper: validates a function pointer before calling
  * ========================================================= */
 static BOOL IsLikelyValidCodePtr(void *p, const char *label)
 {
-    if (!p) { LOG("%s: pointeur NULL", label); return FALSE; }
+    if (!p) { LOG("%s: NULL pointer", label); return FALSE; }
 
     MEMORY_BASIC_INFORMATION mbi;
     if (!VirtualQuery(p, &mbi, sizeof(mbi))) {
-        LOG("%s: VirtualQuery a échoué sur %p (GetLastError=%lu)",
+        LOG("%s: VirtualQuery failed on %p (GetLastError=%lu)",
             label, p, GetLastError());
         return FALSE;
     }
@@ -507,7 +409,7 @@ static BOOL IsLikelyValidCodePtr(void *p, const char *label)
                                   PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
 
     HMODULE hMod = NULL;
-    char modName[MAX_PATH] = "?inconnu?";
+    char modName[MAX_PATH] = "?unknown?";
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            (LPCSTR)p, &hMod)) {
@@ -518,15 +420,13 @@ static BOOL IsLikelyValidCodePtr(void *p, const char *label)
     return execOk;
 }
 
-/* Variante pour un pointeur d'OBJET (this) : on ne s'attend pas à ce que ce
- * soit exécutable (c'est de la donnée, pas du code) — on vérifie juste que
- * la mémoire est lisible et committed, pas garbage/libérée. */
+/* Validates an object pointer (data, not code) */
 static BOOL IsLikelyValidObjectPtr(void *p, const char *label)
 {
-    if (!p) { LOG("%s: pointeur NULL", label); return FALSE; }
+    if (!p) { LOG("%s: NULL pointer", label); return FALSE; }
     MEMORY_BASIC_INFORMATION mbi;
     if (!VirtualQuery(p, &mbi, sizeof(mbi))) {
-        LOG("%s: VirtualQuery a échoué sur %p (GetLastError=%lu)",
+        LOG("%s: VirtualQuery failed on %p (GetLastError=%lu)",
             label, p, GetLastError());
         return FALSE;
     }
@@ -545,7 +445,7 @@ static BOOL GuidEq(REFIID a, const GUID *b)
         && ((const UINT64*)a->Data4)[0] == ((const UINT64*)b->Data4)[0]);
 }
 
-/* GUID → string pour le logging */
+/* GUID to string for logging */
 static const char* GuidName(REFIID riid)
 {
 #define G(n) if(GuidEq(riid,&IID_##n)) return #n
@@ -581,14 +481,14 @@ static const char* GuidNameRaw(REFIID riid)
 #define LOG_GUID(label,riid) LOG("%s riid=%s",(label),GuidNameRaw(riid))
 
 /* =========================================================
- * Types de pointeurs de fonctions — dxgi_real.dll
+ * Function pointer types — system dxgi.dll
  * ========================================================= */
 typedef HRESULT (WINAPI *PFN_CreateDXGIFactory )(REFIID, void**);
 typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1)(REFIID, void**);
 typedef HRESULT (WINAPI *PFN_CreateDXGIFactory2)(UINT,   REFIID, void**);
 
 /* =========================================================
- * Types de pointeurs D3DKMT (gdi32.dll)
+ * D3DKMT function pointers (gdi32.dll)
  * ========================================================= */
 typedef UINT D3DKMT_HANDLE;
 typedef struct { UINT Value; } D3DKMT_SETPROCESSDEVICEREMOVALSUPPORT;
@@ -600,7 +500,7 @@ typedef NTSTATUS (APIENTRY *PFN_D3DKMTCheckVidPnExclusiveOwnership)(const D3DKMT
 typedef NTSTATUS (APIENTRY *PFN_D3DKMTWaitForVerticalBlankEvent)(const D3DKMT_WAITFORVERTICALBLANKEVENT*);
 typedef NTSTATUS (APIENTRY *PFN_D3DKMTWaitForVerticalBlankEvent2)(const D3DKMT_WAITFORVERTICALBLANKEVENT2*);
 
-/* WNF */
+/* WNF (Windows Notification Facility) */
 typedef ULONG64 WNF_STATE_NAME;
 typedef NTSTATUS (NTAPI *WNF_USER_CALLBACK)(WNF_STATE_NAME,ULONG,PVOID,PVOID,PVOID,ULONG);
 typedef PVOID WNF_SUBSCRIPTION_HANDLE;
@@ -610,10 +510,10 @@ typedef NTSTATUS (NTAPI *PFN_RtlQueryWnfStateData)(PULONG,WNF_STATE_NAME,WNF_USE
 typedef NTSTATUS (NTAPI *PFN_RtlUnsubscribeWnfWait)(WNF_SUBSCRIPTION_HANDLE);
 
 /* =========================================================
- * État global
+ * Global state
  * ========================================================= */
 
-static HMODULE               g_hDxgiReal     = NULL;
+static HMODULE               g_hDxgiSystem   = NULL;
 static PFN_CreateDXGIFactory  g_pfnFactory    = NULL;
 static PFN_CreateDXGIFactory1 g_pfnFactory1   = NULL;
 static PFN_CreateDXGIFactory2 g_pfnFactory2   = NULL;
@@ -655,7 +555,7 @@ static DWORD g_dwLogicW  = 0, g_dwLogicH  = 0;
 
 static IUnknown* g_pFallbackFactory = NULL;
 /* =========================================================
- * Private Data Store (pour les wrappers COM)
+ * Private Data Store (for COM wrappers)
  * ========================================================= */
 typedef struct _PRIVENTRY {
     struct _PRIVENTRY *pNext;
@@ -771,7 +671,7 @@ static void PrivData_DestroyAll(PRIVENTRY **ppHead, CRITICAL_SECTION *pcs)
 }
 
 /* =========================================================
- * Macro vtable dispatch
+ * Vtable dispatch macro
  * ========================================================= */
 #define VTBL(obj)           (*(void***)(obj))
 #define VS(obj,off)         (VTBL(obj)[(off)/8])
@@ -784,13 +684,13 @@ static void D3D12_DumpInfoQueue(IUnknown *pD3D12Dev)
     void *pIQ=NULL;
     if(!pD3D12Dev) return;
     if(FAILED(pD3D12Dev->lpVtbl->QueryInterface(pD3D12Dev,&IID_ID3D12InfoQueue,&pIQ)) || !pIQ) {
-        LOG("  D3D12_DumpInfoQueue: ID3D12InfoQueue non disponible");
+        LOG("  D3D12_DumpInfoQueue: ID3D12InfoQueue not available");
         return;
     }
     {
         UINT64 n=((PFN_GetNum)VS(pIQ,D3D12IQ_GetNumStoredMessages_OFF))(pIQ);
         UINT64 i;
-        LOG("  D3D12_DumpInfoQueue: %llu message(s) stocké(s)",(unsigned long long)n);
+        LOG("  D3D12_DumpInfoQueue: %llu message(s) stored",(unsigned long long)n);
         for(i=0;i<n;i++) {
             SIZE_T len=0;
             ((PFN_GetMsg)VS(pIQ,D3D12IQ_GetMessage_OFF))(pIQ,i,NULL,&len);
@@ -813,7 +713,7 @@ static void D3D12_DumpInfoQueue(IUnknown *pD3D12Dev)
 
 
 /* =========================================================
- * ==================== WRAPPERS COM =======================
+ * ==================== COM WRAPPERS =======================
  * ========================================================= */
 typedef struct _DXGIBASE {
     void              *pVtbl;
@@ -854,24 +754,22 @@ static HRESULT WrapFactory_Create(IUnknown *pReal, UINT uFlags, REFIID riid, voi
 
 typedef struct _D3D12Interop {
     /*
-     * Architecture D3D12on7 (ID3D12CommandQueueDownlevel) — API officielle
-     * Microsoft pour présenter du contenu D3D12 sur Windows 7. Pas de
-     * device/swapchain D3D11 caché, pas de copie cross-API manuelle :
-     * le driver gère tout en interne via Present().
+     * D3D12on7 architecture (ID3D12CommandQueueDownlevel) — official
+     * Microsoft API for presenting D3D12 content on Windows 7. No
+     * hidden D3D11 device/swapchain, no manual cross-API copy.
      */
-    void *pD3D12Dev;        /* ID3D12Device* du jeu (ref conservée) */
-    void *pD3D12CQ;         /* ID3D12CommandQueue* du jeu (ref conservée) */
-    void *pDownlevel;       /* ID3D12CommandQueueDownlevel* (QI sur pD3D12CQ) */
-    void *pCmdAlloc;        /* ID3D12CommandAllocator* (notre, pour Present) */
-    void *pCmdList;         /* ID3D12GraphicsCommandList* (notre, pour Present) */
+    void *pD3D12Dev;        /* ID3D12Device* (kept ref) */
+    void *pD3D12CQ;         /* ID3D12CommandQueue* (kept ref) */
+    void *pDownlevel;       /* ID3D12CommandQueueDownlevel* (QI from pD3D12CQ) */
+    void *pCmdAlloc;        /* ID3D12CommandAllocator* (ours, for Present) */
+    void *pCmdList;         /* ID3D12GraphicsCommandList* (ours, for Present) */
     UINT  BufferCount;
     UINT  Width, Height;
     DXGI_FORMAT Format;
     UINT  presentIndex;
     HWND  hwnd;
-    /* Ressources D3D12 "back buffer" normales, exposées à l'app via GetBuffer.
-     * Pas de partage, pas de MISC_SHARED — juste des render targets D3D12
-     * classiques que Present() lit directement. */
+    /* D3D12 "back buffer" resources, exposed via GetBuffer.
+     * No sharing, no MISC_SHARED — just standard D3D12 render targets. */
     void *pD3D12RenderRes[D3D12_INTEROP_MAX_BUFFERS];
 } D3D12Interop;
 
@@ -965,9 +863,8 @@ static HRESULT WrapSC_Create2(IUnknown *pReal, REFIID riid, void **ppOut, WrapSC
     LOG("WrapSC_Create riid=%s", GuidName(riid));
     if (!ppOut) return E_INVALIDARG;
     *ppOut=NULL;
-    /* pReal peut être NULL : cas du wrapper "fantôme" D3D12on7, où il n'y a
-     * pas de vraie IDXGISwapChain1 sous-jacente — toute la logique passe par
-     * w->interop (D3D12Interop), jamais par w->base.pReal. */
+    /* pReal may be NULL: "ghost" wrapper for D3D12on7 where there is no
+     * real IDXGISwapChain1 underneath. */
     w = HeapAlloc(GetProcessHeap(),HEAP_ZERO_MEMORY,sizeof(*w));
     if (!w) return E_OUTOFMEMORY;
     if (pReal) {
@@ -981,12 +878,8 @@ static HRESULT WrapSC_Create2(IUnknown *pReal, REFIID riid, void **ppOut, WrapSC
         Base_Init(&w->base,(void*)g_SC_Vtbl,NULL);
     }
     /*
-     * CRITIQUE : w->interop DOIT être assigné AVANT l'appel à SC_QI ci-dessous.
-     * SC_QI vérifie (w->pReal1 || w->interop) pour autoriser IDXGISwapChain1 ;
-     * si on assigne interop APRÈS cet appel (comme le faisait l'ancien code
-     * appelant juste après WrapSC_Create2), le tout premier QI — celui qui
-     * produit l'objet réellement retourné à l'app — échoue avec
-     * E_NOINTERFACE car w->interop valait encore NULL à ce moment précis.
+     * CRITICAL: w->interop MUST be assigned BEFORE calling SC_QI below.
+     * SC_QI checks (w->pReal1 || w->interop) to accept IDXGISwapChain1.
      */
     w->interop = pInterop;
     hr = SC_QI(w,riid,ppOut);
@@ -1011,7 +904,7 @@ static HRESULT STDMETHODCALLTYPE SC_QI(WrapSC *w, REFIID riid, void **ppv)
         { *ppv=w; SC_AddRef(w); return S_OK; }
     if (GuidEq(riid,&IID_IDXGISwapChain2) && (w->pReal2 || w->interop))
         { *ppv=w; SC_AddRef(w); return S_OK; }
-    /* IDXGISwapChain3 : toujours retourner le wrapper, même si pReal3 est NULL */
+    /* IDXGISwapChain3: always return wrapper, even if pReal3 is NULL */
     if (GuidEq(riid,&IID_IDXGISwapChain3))
         { *ppv=w; SC_AddRef(w); return S_OK; }
     if (GuidEq(riid,&IID_IDXGISwapChain4) && (w->pReal4 || w->interop))
@@ -1026,7 +919,7 @@ static HRESULT STDMETHODCALLTYPE SC_QI(WrapSC *w, REFIID riid, void **ppv)
 }
 
 /* =========================================================
- * Validation mémoire (évite les crashes sur paramètres invalides)
+ * Memory validation (prevents crashes on invalid parameters)
  * ========================================================= */
 static BOOL IsReadablePtr(const void *p, SIZE_T size)
 {
@@ -1067,11 +960,7 @@ static HRESULT STDMETHODCALLTYPE SC_GetParent(WrapSC*w,REFIID riid,void**pp)
     LOG("IDXGISwapChain::GetParent(%s)", GuidName(riid));
     if (!pp) return E_INVALIDARG; *pp=NULL;
     if (w->interop && !w->base.pReal) {
-        /* Pas de swapchain réelle en mode D3D12on7 : on ne peut pas
-         * remonter à la factory réelle. La plupart des moteurs D3D12
-         * n'appellent pas GetParent après CreateSwapChainForHwnd
-         * (ils gardent déjà leur propre pointeur de factory). */
-        LOG("IDXGISwapChain::GetParent: mode D3D12on7, pas de pReal -> DXGI_ERROR_UNSUPPORTED");
+        LOG("IDXGISwapChain::GetParent: D3D12on7 mode, no pReal -> DXGI_ERROR_UNSUPPORTED");
         return DXGI_ERROR_UNSUPPORTED;
     }
     HRESULT hr = ((PFN)VS(w->base.pReal,0x30))(w->base.pReal,riid,pp);
@@ -1093,7 +982,7 @@ static HRESULT STDMETHODCALLTYPE SC_GetBuffer(WrapSC*w,UINT Buf,REFIID riid,void
 {
     typedef HRESULT(STDMETHODCALLTYPE*PFN)(void*,UINT,REFIID,void**);
     HRESULT hr;
-    LOG("IDXGISwapChain::GetBuffer(%u,%s)",Buf,GuidNameRaw(riid)); /* LOG avec le GUID complet */
+    LOG("IDXGISwapChain::GetBuffer(%u,%s)",Buf,GuidNameRaw(riid));
     if(!pp) return E_INVALIDARG; *pp=NULL;
     
     if(w->interop) { 
@@ -1102,7 +991,7 @@ static HRESULT STDMETHODCALLTYPE SC_GetBuffer(WrapSC*w,UINT Buf,REFIID riid,void
         return hr; 
     }
     
-    /* Si le GUID est un GUID D3D11/DXGI standard, on le passe au pReal */
+    /* If the GUID is a standard D3D11/DXGI GUID, pass through to pReal */
     if(GuidEq(riid, &IID_ID3D11Texture2D) || GuidEq(riid, &IID_IDXGISurface) ||
        GuidEq(riid, &IID_IDXGIResource) || GuidEq(riid, &IID_ID3D11Resource) ||
        GuidEq(riid, &IID_IDXGISurface1) || GuidEq(riid, &IID_IDXGISurface2)) {
@@ -1111,20 +1000,16 @@ static HRESULT STDMETHODCALLTYPE SC_GetBuffer(WrapSC*w,UINT Buf,REFIID riid,void
         return hr;
     }
     
-    /*
-     * Pour les GUIDs inconnus (comme IDXGISwapChain3), on récupère d'abord
-     * la texture en tant que IUnknown, puis on la retourne directement.
-     * Le jeu pourra faire le QI lui-même.
-     */
+    /* For unknown GUIDs, get texture as IUnknown and return it directly */
     void *pTex = NULL;
     hr = ((PFN)VS(w->base.pReal,0x48))(w->base.pReal, Buf, &IID_IUnknown_, &pTex);
     if(SUCCEEDED(hr) && pTex) {
-        LOG("IDXGISwapChain::GetBuffer: retourne IUnknown=%p pour GUID inconnu %s", pTex, GuidName(riid));
+        LOG("IDXGISwapChain::GetBuffer: returning IUnknown=%p for unknown GUID %s", pTex, GuidName(riid));
         *pp = pTex;
         return S_OK;
     }
     
-    /* Fallback : déléguer directement */
+    /* Fallback: delegate directly */
     hr = ((PFN)VS(w->base.pReal,0x48))(w->base.pReal,Buf,riid,pp);
     LOG_LEAVE("IDXGISwapChain::GetBuffer",hr); 
     return hr;
@@ -1625,7 +1510,7 @@ static HRESULT STDMETHODCALLTYPE WF_QI(WrapFactory *w, REFIID riid, void **ppv)
         GuidEq(riid,&IID_IDXGIFactory4)|| GuidEq(riid,&IID_IDXGIFactory5) ||
         GuidEq(riid,&IID_IDXGIFactory6)|| GuidEq(riid,&IID_IDXGIFactory7);
     if(ok){ *ppv=w; WF_AddRef(w); return S_OK; }
-    LOG_GUID("IDXGIFactory::QI unknown -> passthrough vers pReal",riid);
+    LOG_GUID("IDXGIFactory::QI unknown -> passthrough to pReal",riid);
     HRESULT hrp = w->base.pReal->lpVtbl->QueryInterface(w->base.pReal, riid, ppv);
     LOG("IDXGIFactory::QI passthrough = 0x%08X *ppv=%p",(unsigned)hrp,*ppv);
     return hrp;
@@ -1680,17 +1565,17 @@ static HRESULT STDMETHODCALLTYPE WF_CreateSwapChain(WrapFactory*w, IUnknown*pDev
     if (!pp) return E_INVALIDARG; *pp = NULL;
     if (!pDev || !pDesc) return E_INVALIDARG;
 
-    // Vérifier si pDev est une ID3D12CommandQueue (ou ID3D12Device)
+    // Check if pDev is an ID3D12CommandQueue (or ID3D12Device)
     void *pCQ = NULL;
     HRESULT hrQI = pDev->lpVtbl->QueryInterface(pDev, &IID_ID3D12CommandQueue, &pCQ);
     if (SUCCEEDED(hrQI) && pCQ) {
-        // C'est un périphérique D3D12 → utiliser notre interop
-        LOG("  IDXGIFactory::CreateSwapChain: périphérique D3D12 détecté -> D3D12on7");
+        // This is a D3D12 device → use our interop
+        LOG("  IDXGIFactory::CreateSwapChain: D3D12 device detected -> D3D12on7");
 
         DXGI_SWAP_CHAIN_DESC *pDesc1 = (DXGI_SWAP_CHAIN_DESC*)pDesc;
         HWND hwnd = pDesc1->OutputWindow;
 
-        // Convertir DXGI_SWAP_CHAIN_DESC → DXGI_SWAP_CHAIN_DESC1
+        // Convert DXGI_SWAP_CHAIN_DESC → DXGI_SWAP_CHAIN_DESC1
         DXGI_SWAP_CHAIN_DESC1 desc1 = {0};
         desc1.Width = pDesc1->BufferDesc.Width;
         desc1.Height = pDesc1->BufferDesc.Height;
@@ -1699,21 +1584,21 @@ static HRESULT STDMETHODCALLTYPE WF_CreateSwapChain(WrapFactory*w, IUnknown*pDev
         desc1.SampleDesc = pDesc1->SampleDesc;
         desc1.BufferUsage = pDesc1->BufferUsage;
         desc1.BufferCount = pDesc1->BufferCount;
-        desc1.Scaling = DXGI_SCALING_STRETCH;      // valeur par défaut
-        desc1.SwapEffect = DXGI_SWAP_EFFECT_DISCARD; // ou FLIP_DISCARD selon support
+        desc1.Scaling = DXGI_SCALING_STRETCH;
+        desc1.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
         desc1.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
         desc1.Flags = pDesc1->Flags;
 
-        // Créer l'interop D3D12
-        IUnknown *pRealSC = NULL; // pas de swapchain réelle
+        // Create D3D12 interop
+        IUnknown *pRealSC = NULL;
         D3D12Interop *it = D3D12Interop_Create((IUnknown*)pCQ, hwnd, &desc1, &pRealSC);
         ((IUnknown*)pCQ)->lpVtbl->Release((IUnknown*)pCQ);
         if (!it) {
-            LOG("  IDXGIFactory::CreateSwapChain: D3D12Interop_Create a échoué");
+            LOG("  IDXGIFactory::CreateSwapChain: D3D12Interop_Create failed");
             return E_FAIL;
         }
 
-        // Créer le wrapper de swapchain (sans pReal)
+        // Create swapchain wrapper (without pReal)
         WrapSC *wsc = NULL;
         HRESULT hr2 = WrapSC_Create2(NULL, &IID_IDXGISwapChain1, pp, &wsc, it);
         if (FAILED(hr2) || !wsc) {
@@ -1725,7 +1610,7 @@ static HRESULT STDMETHODCALLTYPE WF_CreateSwapChain(WrapFactory*w, IUnknown*pDev
         return S_OK;
     }
 
-    // Si on arrive ici, ce n'est pas un périphérique D3D12 → déléguer à la factory réelle
+    // Not a D3D12 device → delegate to real factory
     if (pCQ) ((IUnknown*)pCQ)->lpVtbl->Release((IUnknown*)pCQ);
 
     void *pSC = NULL;
@@ -1855,7 +1740,7 @@ static HRESULT D3D12_CreateSharedRT(
         (unsigned)hr, pD3D12Res);
 
     if (FAILED(hr) || !pD3D12Res) {
-        LOG("D3D12_CreateSharedRT: retry OpenSharedHandle avec IID_IUnknown_...");
+        LOG("D3D12_CreateSharedRT: retry OpenSharedHandle with IID_IUnknown_...");
         hr = ((PFN_OpenSharedHandle)VS(pD3D12Dev, D3D12DEV_OpenSharedHandle_OFF))(
             pD3D12Dev, hWin32, &IID_IUnknown_, &pD3D12Res);
         LOG("D3D12_CreateSharedRT: retry OpenSharedHandle = 0x%08X pD3D12Res=%p",
@@ -1882,45 +1767,35 @@ static D3D12Interop* D3D12Interop_Create(IUnknown *pD3D12CQ, HWND hwnd,
     D3D12Interop *it = NULL;
     IUnknown *pD3D12Dev = NULL;
     void *pDownlevel = NULL;
-    /* volatile : requis pour que la valeur soit fiable après un longjmp
-     * (cf. SEH_TRY/SEH_EXCEPT) déclenché par notre VEH en cas d'exception
-     * pendant CreateCommandAllocator/CreateCommandList. Sans volatile, GCC
-     * pourrait conserver ces variables en registre et leur valeur après le
-     * saut serait indéterminée (comportement non spécifié du C standard
-     * pour setjmp/longjmp). */
+    /* volatile: required for reliability after longjmp (SEH) */
     volatile void *pCmdAlloc = NULL;
     volatile void *pCmdList = NULL;
     volatile HRESULT hr;
     UINT i;
 
-    LOG("D3D12Interop_Create: entrée (D3D12on7 / Downlevel)");
+    LOG("D3D12Interop_Create: entry (D3D12on7 / Downlevel)");
     if (!pDesc) { LOG("D3D12Interop_Create: pDesc==NULL"); return NULL; }
     LOG("D3D12Interop_Create: %ux%u fmt=%u BufferCount=%u Flags=0x%X",
         pDesc->Width, pDesc->Height, (unsigned)pDesc->Format, pDesc->BufferCount, pDesc->Flags);
     if (pDesc->BufferCount == 0 || pDesc->BufferCount > D3D12_INTEROP_MAX_BUFFERS) {
-        LOG("D3D12Interop_Create: BufferCount=%u hors limites", pDesc->BufferCount);
+        LOG("D3D12Interop_Create: BufferCount=%u out of range", pDesc->BufferCount);
         return NULL;
     }
 
     pD3D12Dev = D3D12_GetDeviceFromQueue(pD3D12CQ);
-    if (!pD3D12Dev) { LOG("D3D12Interop_Create: impossible de remonter au ID3D12Device"); return NULL; }
+    if (!pD3D12Dev) { LOG("D3D12Interop_Create: failed to get ID3D12Device"); return NULL; }
     IsLikelyValidObjectPtr(pD3D12Dev, "pD3D12Dev (this)");
-    IsLikelyValidCodePtr(*(void**)pD3D12Dev, "pD3D12Dev vtable ptr (1ere entree)");
+    IsLikelyValidCodePtr(*(void**)pD3D12Dev, "pD3D12Dev vtable ptr (first entry)");
 
-    /* Étape clé : QI de la CommandQueue du jeu vers ID3D12CommandQueueDownlevel.
-     * Si ça échoue, le système ne supporte pas D3D12on7 (pas de pack downlevel
-     * installé, ou pas Win7/8). */
+    /* QI the app's CommandQueue for ID3D12CommandQueueDownlevel */
     hr = pD3D12CQ->lpVtbl->QueryInterface(pD3D12CQ, &IID_ID3D12CommandQueueDownlevel, &pDownlevel);
     LOG("D3D12Interop_Create: QI(ID3D12CommandQueueDownlevel) = 0x%08X pDownlevel=%p", (unsigned)hr, pDownlevel);
     if (FAILED(hr) || !pDownlevel) {
-        LOG("D3D12Interop_Create: D3D12on7 non supporté sur ce système");
+        LOG("D3D12Interop_Create: D3D12on7 not supported on this system");
         goto fail;
     }
 
-    /* Créer notre propre CommandAllocator + CommandList DIRECT, requis par
-     * ID3D12CommandQueueDownlevel::Present (pOpenCommandList). On la garde
-     * ouverte/fermée entre chaque Present : Present() la ferme et la soumet
-     * elle-même, donc on doit la Reset() avant chaque appel. */
+    /* Create our own CommandAllocator + CommandList DIRECT */
     {
         typedef HRESULT(STDMETHODCALLTYPE*PFN_CreateCmdAlloc)(void*, D3D12_COMMAND_LIST_TYPE_, REFIID, void**);
         void *pFn = VS(pD3D12Dev, D3D12DEV_CreateCommandAllocator_OFF);
@@ -1932,7 +1807,7 @@ static D3D12Interop* D3D12Interop_Create(IUnknown *pD3D12CQ, HWND hwnd,
                 pD3D12Dev, D3D12_COMMAND_LIST_TYPE_DIRECT_, &IID_ID3D12CommandAllocator, &pTmpAlloc);
             pCmdAlloc = pTmpAlloc;
         } SEH_EXCEPT(exCode) {
-            LOG("D3D12Interop_Create: CreateCommandAllocator a levé une EXCEPTION 0x%08X",
+            LOG("D3D12Interop_Create: CreateCommandAllocator raised EXCEPTION 0x%08X",
                 (unsigned)exCode);
             hr = E_FAIL;
             pCmdAlloc = NULL;
@@ -1945,21 +1820,15 @@ static D3D12Interop* D3D12Interop_Create(IUnknown *pD3D12CQ, HWND hwnd,
         void *pFn = VS(pD3D12Dev, D3D12DEV_CreateCommandList_OFF);
         DWORD exCode = 0;
         void *pTmpList = NULL;
-        void *pCmdAllocSnapshot = (void*)pCmdAlloc; /* copie non-volatile pour l'appel */
+        void *pCmdAllocSnapshot = (void*)pCmdAlloc;
         IsLikelyValidCodePtr(pFn, "D3D12DEV_CreateCommandList_OFF");
-        /*
-         * Protection contre exception (CFG, ou tout autre crash dans le
-         * pack Direct3D12Downlevel) : on la capture proprement et on log
-         * le code d'exception exact au lieu de laisser planter tout le
-         * process hôte. Permet de diagnostiquer sans perdre le contexte.
-         */
         SEH_TRY {
             hr = ((PFN_CreateCmdList)pFn)(
                 pD3D12Dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT_, pCmdAllocSnapshot, NULL, &IID_ID3D12GraphicsCommandList, &pTmpList);
             pCmdList = pTmpList;
         } SEH_EXCEPT(exCode) {
-            LOG("D3D12Interop_Create: CreateCommandList a levé une EXCEPTION 0x%08X "
-                "(STATUS_ACCESS_DENIED=0xC0000022 typique d'un blocage CFG) — "
+            LOG("D3D12Interop_Create: CreateCommandList raised EXCEPTION 0x%08X "
+                "(STATUS_ACCESS_DENIED=0xC0000022 typical of CFG blocking) — "
                 "pFn=%p pD3D12Dev=%p pCmdAlloc=%p",
                 (unsigned)exCode, pFn, pD3D12Dev, pCmdAllocSnapshot);
             hr = E_FAIL;
@@ -1967,9 +1836,7 @@ static D3D12Interop* D3D12Interop_Create(IUnknown *pD3D12CQ, HWND hwnd,
         } SEH_END
         LOG("D3D12Interop_Create: CreateCommandList = 0x%08X pCmdList=%p", (unsigned)hr, pCmdList);
         if (FAILED(hr) || !pCmdList) goto fail;
-        /* CreateCommandList retourne la liste à l'état "recording" (ouverte).
-         * Present() attend une liste ouverte, donc on la laisse telle quelle
-         * pour le premier appel. */
+        /* CreateCommandList returns list in "recording" (open) state */
     }
 
     it = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*it));
@@ -1983,8 +1850,7 @@ static D3D12Interop* D3D12Interop_Create(IUnknown *pD3D12CQ, HWND hwnd,
     it->Width = pDesc->Width; it->Height = pDesc->Height; it->Format = pDesc->Format;
     it->hwnd = hwnd;
 
-    /* Créer les ressources "back buffer" D3D12 normales (pas de partage). */
-        /* Créer les ressources "back buffer" D3D12 normales (pas de partage). */
+    /* Create D3D12 "back buffer" resources (no sharing) */
     for (i = 0; i < it->BufferCount; i++) {
         typedef HRESULT(STDMETHODCALLTYPE*PFN_CCR)(void*, const D3D12_HEAP_PROPERTIES_MIN*,
             D3D12_HEAP_FLAGS_, const D3D12_RESOURCE_DESC_MIN*, D3D12_RESOURCE_STATES_, const void*, REFIID, void**);
@@ -2012,8 +1878,6 @@ static D3D12Interop* D3D12Interop_Create(IUnknown *pD3D12CQ, HWND hwnd,
     }
 
     LOG("D3D12Interop_Create: OK (D3D12on7), %u buffers %ux%u", it->BufferCount, it->Width, it->Height);
-    /* Pas de swapchain D3D11 réelle dans cette approche : ppRealSC reste
-     * NULL, WrapSC_Create2 doit gérer ce cas (objet "fantôme"). */
     *ppRealSC = NULL;
     return it;
 
@@ -2044,11 +1908,10 @@ static void D3D12Interop_Destroy(D3D12Interop *it)
 static HRESULT D3D12Interop_GetBuffer(WrapSC *w, UINT Buf, REFIID riid, void **pp)
 {
     D3D12Interop *it = w->interop;
-    (void)riid; /* on ignore le GUID demandé, on retourne toujours ID3D12Resource */
+    (void)riid; /* always return ID3D12Resource */
     if (!it) return E_NOTIMPL;
-    if (Buf >= it->BufferCount) { LOG("D3D12Interop_GetBuffer: Buf=%u hors limites", Buf); return DXGI_ERROR_INVALID_CALL; }
+    if (Buf >= it->BufferCount) { LOG("D3D12Interop_GetBuffer: Buf=%u out of range", Buf); return DXGI_ERROR_INVALID_CALL; }
     if (!it->pD3D12RenderRes[Buf]) return E_FAIL;
-    /* On retourne directement le pointeur ID3D12Resource (déjà stocké comme tel) */
     ((IUnknown*)it->pD3D12RenderRes[Buf])->lpVtbl->AddRef((IUnknown*)it->pD3D12RenderRes[Buf]);
     *pp = it->pD3D12RenderRes[Buf];
     LOG("D3D12Interop_GetBuffer(%u) -> pD3D12Resource=%p", Buf, *pp);
@@ -2071,55 +1934,53 @@ static HRESULT D3D12Interop_Present(WrapSC *w, UINT SyncInterval, UINT Flags, HR
     LOG("D3D12Interop_Present: idx=%u (D3D12on7), SyncInterval=%u, Flags=0x%X",
         idx, SyncInterval, Flags);
 
-    // Vérification des pointeurs critiques
     if (!it->pDownlevel || !it->pCmdList || !it->pD3D12RenderRes[idx]) {
-        LOG("D3D12Interop_Present: pointeur NULL - pDownlevel=%p, pCmdList=%p, pRes=%p",
+        LOG("D3D12Interop_Present: NULL pointer - pDownlevel=%p, pCmdList=%p, pRes=%p",
             it->pDownlevel, it->pCmdList, it->pD3D12RenderRes[idx]);
         *outHr = E_FAIL;
         return E_FAIL;
     }
 
-    // Reset de la command list pour chaque Present sauf le premier
+    /* Reset command list for every Present except the first one */
     if (it->presentIndex > 0) {
         typedef HRESULT (STDMETHODCALLTYPE *PFN_AllocReset)(void*);
         typedef HRESULT (STDMETHODCALLTYPE *PFN_ListReset)(void*, void*, void*);
 
-        // Récupérer les pointeurs de fonction
         PFN_AllocReset pfnAllocReset = (PFN_AllocReset)VS(it->pCmdAlloc, D3D12_COMMAND_ALLOCATOR_RESET_OFF);
         if (!pfnAllocReset) {
-            LOG("D3D12Interop_Present: impossible d'obtenir ID3D12CommandAllocator::Reset");
+            LOG("D3D12Interop_Present: failed to get ID3D12CommandAllocator::Reset");
             *outHr = E_FAIL;
             return E_FAIL;
         }
         hr = pfnAllocReset(it->pCmdAlloc);
         if (FAILED(hr)) {
-            LOG("D3D12Interop_Present: Allocator::Reset a échoué (0x%08X)", (unsigned)hr);
+            LOG("D3D12Interop_Present: Allocator::Reset failed (0x%08X)", (unsigned)hr);
             *outHr = hr;
             return hr;
         }
 
         PFN_ListReset pfnListReset = (PFN_ListReset)VS(it->pCmdList, D3D12_GRAPHICS_COMMAND_LIST_RESET_OFF);
         if (!pfnListReset) {
-            LOG("D3D12Interop_Present: impossible d'obtenir ID3D12GraphicsCommandList::Reset");
+            LOG("D3D12Interop_Present: failed to get ID3D12GraphicsCommandList::Reset");
             *outHr = E_FAIL;
             return E_FAIL;
         }
         hr = pfnListReset(it->pCmdList, it->pCmdAlloc, NULL);
         if (FAILED(hr)) {
-            LOG("D3D12Interop_Present: CommandList::Reset a échoué (0x%08X)", (unsigned)hr);
+            LOG("D3D12Interop_Present: CommandList::Reset failed (0x%08X)", (unsigned)hr);
             *outHr = hr;
             return hr;
         }
         LOG("D3D12Interop_Present: Reset OK (allocator + command list)");
     } else {
-        LOG("D3D12Interop_Present: premier Present, command list déjà ouverte");
+        LOG("D3D12Interop_Present: first Present, command list already open");
     }
 
-    // Appel de ID3D12CommandQueueDownlevel::Present
+    /* Call ID3D12CommandQueueDownlevel::Present */
     typedef HRESULT (STDMETHODCALLTYPE *PFN_DLPresent)(void*, void*, void*, HWND, D3D12_DOWNLEVEL_PRESENT_FLAGS_);
     PFN_DLPresent pfnPresent = (PFN_DLPresent)VS(it->pDownlevel, D3D12_COMMAND_QUEUE_DOWNLEVEL_PRESENT_OFF);
     if (!pfnPresent) {
-        LOG("D3D12Interop_Present: impossible d'obtenir ID3D12CommandQueueDownlevel::Present");
+        LOG("D3D12Interop_Present: failed to get ID3D12CommandQueueDownlevel::Present");
         *outHr = E_FAIL;
         return E_FAIL;
     }
@@ -2131,14 +1992,12 @@ static HRESULT D3D12Interop_Present(WrapSC *w, UINT SyncInterval, UINT Flags, HR
                     D3D12_DOWNLEVEL_PRESENT_FLAG_NONE_);
     LOG("D3D12Interop_Present: ID3D12CommandQueueDownlevel::Present = 0x%08X", (unsigned)hr);
 
-    // Si échec, dump de la info queue pour diagnostic
     if (FAILED(hr)) {
         D3D12_DumpInfoQueue(it->pD3D12Dev);
         *outHr = hr;
         return hr;
     }
 
-    // Incrémenter l'index pour le prochain buffer
     it->presentIndex++;
     *outHr = S_OK;
     return S_OK;
@@ -2154,26 +2013,23 @@ static HRESULT STDMETHODCALLTYPE WF_CreateSwapChainForHwnd(WrapFactory*w,IUnknow
     F2_GUARD(DXGI_ERROR_UNSUPPORTED);
     if(!pp) return E_INVALIDARG; *pp=NULL;
 
-    /* Détection D3D12 */
+    /* D3D12 detection */
     {
         void *pCQ=NULL;
         HRESULT hrcq = pDev ? pDev->lpVtbl->QueryInterface(pDev,&IID_ID3D12CommandQueue,&pCQ) : E_POINTER;
         if(SUCCEEDED(hrcq) && pCQ) {
-            IUnknown *pRealSC=NULL; /* reste NULL : pas de swapchain réelle en D3D12on7 */
+            IUnknown *pRealSC=NULL;
             D3D12Interop *it;
-            LOG("  CreateSwapChainForHwnd: ID3D12CommandQueue détectée -> D3D12on7 (Downlevel)");
+            LOG("  CreateSwapChainForHwnd: ID3D12CommandQueue detected -> D3D12on7 (Downlevel)");
             it = D3D12Interop_Create((IUnknown*)pCQ, hwnd, pD, &pRealSC);
             ((IUnknown*)pCQ)->lpVtbl->Release((IUnknown*)pCQ);
             if(!it) {
-                LOG("  CreateSwapChainForHwnd: D3D12Interop_Create a échoué");
+                LOG("  CreateSwapChainForHwnd: D3D12Interop_Create failed");
                 LOG_LEAVE("IDXGIFactory2::CreateSwapChainForHwnd",E_FAIL);
                 return E_FAIL;
             }
             {
                 WrapSC *wsc=NULL;
-                /* 'it' est passé directement ici (et non assigné après coup) :
-                 * SC_QI a besoin de voir w->interop déjà rempli pour accepter
-                 * IID_IDXGISwapChain1 sur ce wrapper "fantôme" sans pReal. */
                 HRESULT hr2=WrapSC_Create2(NULL,&IID_IDXGISwapChain1,pp,&wsc,it);
                 if(FAILED(hr2)||!wsc) {
                     LOG("  CreateSwapChainForHwnd: WrapSC_Create2 = 0x%08X",(unsigned)hr2);
@@ -2187,10 +2043,10 @@ static HRESULT STDMETHODCALLTYPE WF_CreateSwapChainForHwnd(WrapFactory*w,IUnknow
         }
     }
 
-    /* Chemin normal D3D11/D3D9 */
+    /* Normal D3D11/D3D9 path */
     void *pSC=NULL;
     HRESULT hr=((PFN)VS(w->pRealF2,0x78))(w->pRealF2,pDev,hwnd,pD,pFD,pRO,&pSC);
-    LOG("  IDXGIFactory2::CreateSwapChainForHwnd (appel réel) = 0x%08X pSC=%p",(unsigned)hr,pSC);
+    LOG("  IDXGIFactory2::CreateSwapChainForHwnd (real call) = 0x%08X pSC=%p",(unsigned)hr,pSC);
     if(SUCCEEDED(hr)) hr=WrapSC_Create((IUnknown*)pSC,&IID_IDXGISwapChain1,pp);
     if(pSC) { ((IUnknown*)pSC)->lpVtbl->Release((IUnknown*)pSC); pSC=NULL; }
     LOG_LEAVE("IDXGIFactory2::CreateSwapChainForHwnd",hr); return hr;
@@ -2385,7 +2241,7 @@ static FARPROC PIX_Intercept(FARPROC pfnDefault, LPCSTR pGetPP, LPCSTR pGen)
 }
 
 /* =========================================================
- * =================== EXPORTS PUBLICS ====================
+ * =================== PUBLIC EXPORTS ====================
  * ========================================================= */
 
 __declspec(dllexport)
@@ -2415,7 +2271,7 @@ HRESULT WINAPI CreateDXGIFactory1(REFIID riid, void **ppFactory)
 {
     HRESULT hr;
     LOG_ENTER("CreateDXGIFactory1");
-    LOG_GUID("  CreateDXGIFactory1: demande",riid);
+    LOG_GUID("  CreateDXGIFactory1: request",riid);
     LOG("  CreateDXGIFactory1: ppFactory=%p",(void*)ppFactory);
     if(!ppFactory) { LOG_LEAVE("CreateDXGIFactory1",E_INVALIDARG); return E_INVALIDARG; }
     *ppFactory=NULL;
@@ -2428,10 +2284,10 @@ HRESULT WINAPI CreateDXGIFactory1(REFIID riid, void **ppFactory)
     typedef HRESULT(WINAPI*PFN)(REFIID,void**);
     PFN pfn=(PFN)PIX_Intercept((FARPROC)pfnReal,
         "GetRealPtrPtrCreateDXGIFactory1","CreateDXGIFactory1Generated");
-    LOG("  CreateDXGIFactory1: pfn (apres PIX_Intercept)=%p",(void*)pfn);
+    LOG("  CreateDXGIFactory1: pfn (after PIX_Intercept)=%p",(void*)pfn);
 
     IUnknown *pRaw=NULL;
-    LOG("  CreateDXGIFactory1: --> appel pfn(IID_IDXGIFactory1,&pRaw)");
+    LOG("  CreateDXGIFactory1: --> call pfn(IID_IDXGIFactory1,&pRaw)");
     hr=pfn(&IID_IDXGIFactory1,(void**)&pRaw);
     LOG("  CreateDXGIFactory1: <-- pfn = 0x%08X pRaw=%p",(unsigned)hr,(void*)pRaw);
     if(SUCCEEDED(hr)&&pRaw) {
@@ -2449,49 +2305,49 @@ HRESULT WINAPI CreateDXGIFactory2(UINT Flags, REFIID riid, void **ppFactory)
     HRESULT hr;
     LOG_ENTER("CreateDXGIFactory2");
     LOG("  CreateDXGIFactory2: Flags=0x%X ppFactory=%p", Flags, (void*)ppFactory);
-    LOG_GUID("  CreateDXGIFactory2: demande", riid);
+    LOG_GUID("  CreateDXGIFactory2: request", riid);
 
-    /* --- Vérification stricte des paramètres --- */
+    /* --- Strict parameter validation --- */
     if (!ppFactory) {
-        LOG("  CreateDXGIFactory2: ppFactory est NULL");
+        LOG("  CreateDXGIFactory2: ppFactory is NULL");
         LOG_LEAVE("CreateDXGIFactory2", E_INVALIDARG);
         return E_INVALIDARG;
     }
     if (!IsWriteablePtr(ppFactory, sizeof(void*))) {
-        LOG("  CreateDXGIFactory2: ppFactory=%p inaccessible en écriture", (void*)ppFactory);
+        LOG("  CreateDXGIFactory2: ppFactory=%p not writable", (void*)ppFactory);
         LOG_LEAVE("CreateDXGIFactory2", E_INVALIDARG);
         return E_INVALIDARG;
     }
     if (!riid) {
-        LOG("  CreateDXGIFactory2: riid est NULL");
+        LOG("  CreateDXGIFactory2: riid is NULL");
         LOG_LEAVE("CreateDXGIFactory2", E_INVALIDARG);
         return E_INVALIDARG;
     }
     if (!IsReadablePtr(riid, sizeof(GUID))) {
-        LOG("  CreateDXGIFactory2: riid=%p illisible", (void*)riid);
+        LOG("  CreateDXGIFactory2: riid=%p unreadable", (void*)riid);
         LOG_LEAVE("CreateDXGIFactory2", E_INVALIDARG);
         return E_INVALIDARG;
     }
-    /* Vérifier que le GUID n'est pas nul */
+    /* Check that the GUID is not null */
     {
         const GUID *g = riid;
         if (g->Data1 == 0 && g->Data2 == 0 && g->Data3 == 0 &&
             ((const UINT64*)g->Data4)[0] == 0 && ((const UINT64*)g->Data4)[1] == 0) {
-            LOG("  CreateDXGIFactory2: riid est le GUID nul (invalide)");
+            LOG("  CreateDXGIFactory2: riid is null GUID (invalid)");
             LOG_LEAVE("CreateDXGIFactory2", E_INVALIDARG);
             return E_INVALIDARG;
         }
     }
 
-    /* Nettoyer les flags */
+    /* Clean flags */
     UINT cleanFlags = Flags & DXGI_CREATE_FACTORY_DEBUG;
     if (cleanFlags != Flags) {
-        LOG("  CreateDXGIFactory2: flags 0x%X nettoyés en 0x%X", Flags, cleanFlags);
+        LOG("  CreateDXGIFactory2: flags 0x%X cleaned to 0x%X", Flags, cleanFlags);
     }
 
-    /* Gestion du debug layer */
+    /* Debug layer handling */
     if (cleanFlags & DXGI_CREATE_FACTORY_DEBUG) {
-        LOG("  CreateDXGIFactory2: DXGI_CREATE_FACTORY_DEBUG demandé");
+        LOG("  CreateDXGIFactory2: DXGI_CREATE_FACTORY_DEBUG requested");
         HMODULE hDbg = LoadLibraryExW(L"DXGIDebug.dll", NULL, LOAD_LIBRARY_AS_DATAFILE);
         if (!hDbg) {
             OutputDebugStringA("CreateDXGIFactory2: DXGI_CREATE_FACTORY_DEBUG but DXGIDebug.dll missing\n");
@@ -2507,18 +2363,18 @@ HRESULT WINAPI CreateDXGIFactory2(UINT Flags, REFIID riid, void **ppFactory)
         typedef HRESULT(WINAPI*PFN)(UINT, REFIID, void**);
         PFN pfn = (PFN)PIX_Intercept((FARPROC)g_pfnFactory2,
             "GetRealPtrPtrCreateDXGIFactory2", "CreateDXGIFactory2Generated");
-        LOG("  CreateDXGIFactory2: --> appel pfn(Flags=0x%X, riid, &pRaw) [Factory2]", cleanFlags);
+        LOG("  CreateDXGIFactory2: --> call pfn(Flags=0x%X, riid, &pRaw) [Factory2]", cleanFlags);
         hr = pfn(cleanFlags, riid, (void**)&pRaw);
         LOG("  CreateDXGIFactory2: <-- pfn = 0x%08X pRaw=%p [Factory2]", (unsigned)hr, (void*)pRaw);
     } else {
         if (cleanFlags & ~DXGI_CREATE_FACTORY_DEBUG)
-            LOG("  CreateDXGIFactory2: flags 0x%X ignorés sur Win7 (pas de Factory2)", cleanFlags);
+            LOG("  CreateDXGIFactory2: flags 0x%X ignored on Win7 (no Factory2)", cleanFlags);
         PFN_CreateDXGIFactory1 pfnReal = g_pfnFactory1 ? g_pfnFactory1 : (PFN_CreateDXGIFactory1)g_pfnFactory;
         if (!pfnReal) {
             LOG_LEAVE("CreateDXGIFactory2", DXGI_ERROR_UNSUPPORTED);
             return DXGI_ERROR_UNSUPPORTED;
         }
-        LOG("  CreateDXGIFactory2: --> appel pfnReal(IID_IDXGIFactory1, &pRaw) [fallback Factory1]");
+        LOG("  CreateDXGIFactory2: --> call pfnReal(IID_IDXGIFactory1, &pRaw) [fallback Factory1]");
         hr = pfnReal(&IID_IDXGIFactory1, (void**)&pRaw);
         LOG("  CreateDXGIFactory2: <-- pfnReal = 0x%08X pRaw=%p [fallback Factory1]", (unsigned)hr, (void*)pRaw);
     }
@@ -2529,7 +2385,7 @@ HRESULT WINAPI CreateDXGIFactory2(UINT Flags, REFIID riid, void **ppFactory)
         LOG("  CreateDXGIFactory2: <-- WrapFactory_Create = 0x%08X ppFactory=%p", (unsigned)hr, *ppFactory);
         pRaw->lpVtbl->Release(pRaw);
     } else {
-        LOG("  CreateDXGIFactory2: échec de la création (hr=0x%08X)", (unsigned)hr);
+        LOG("  CreateDXGIFactory2: creation failed (hr=0x%08X)", (unsigned)hr);
         *ppFactory = NULL;
     }
 
@@ -2721,7 +2577,7 @@ HRESULT WINAPI DXGIDeclareAdapterRemovalSupport(void)
 {
     LOG_ENTER("DXGIDeclareAdapterRemovalSupport");
     if(!g_D3DKMTSetProcessDeviceRemovalSupport) {
-        LOG("  D3DKMTSetProcessDeviceRemovalSupport non disponible");
+        LOG("  D3DKMTSetProcessDeviceRemovalSupport not available");
         LOG_LEAVE("DXGIDeclareAdapterRemovalSupport",DXGI_ERROR_UNSUPPORTED);
         return DXGI_ERROR_UNSUPPORTED;
     }
@@ -2747,7 +2603,7 @@ HRESULT WINAPI DXGIGetDebugInterface1(UINT Flags, REFIID riid, void **ppDebug)
     }
     if(!hDbg) hDbg=LoadLibraryExW(L"DXGIDebug.dll",NULL,LOAD_LIBRARY_SEARCH_SYSTEM32);
     if(!hDbg) {
-        LOG("  DXGIDebug.dll introuvable");
+        LOG("  DXGIDebug.dll not found");
         LOG_LEAVE("DXGIGetDebugInterface1",DXGI_ERROR_SDK_COMPONENT_MISSING);
         return DXGI_ERROR_SDK_COMPONENT_MISSING;
     }
@@ -2771,26 +2627,26 @@ HRESULT WINAPI DXGIReportAdapterConfiguration(DWORD dwFlags)
 }
 
 /* =========================================================
- * Initialisation / finalisation
+ * Initialization / cleanup
  * ========================================================= */
-static BOOL Init_RealDxgi(void)
+static BOOL Init_SystemDxgi(void)
 {
-    g_hDxgiReal=LoadLibraryExW(L"dxgi_real.dll",NULL,LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if(!g_hDxgiReal) {
+    g_hDxgiSystem = LoadLibraryExW(L"dxgi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!g_hDxgiSystem) {
         WCHAR path[MAX_PATH];
-        GetSystemDirectoryW(path,MAX_PATH);
-        lstrcatW(path,L"\\dxgi_real.dll");
-        g_hDxgiReal=LoadLibraryW(path);
+        GetSystemDirectoryW(path, MAX_PATH);
+        lstrcatW(path, L"\\dxgi.dll");
+        g_hDxgiSystem = LoadLibraryW(path);
     }
-    if(!g_hDxgiReal) {
-        OutputDebugStringA("[dxgi_win7] ERREUR: dxgi_real.dll introuvable !\n");
+    if (!g_hDxgiSystem) {
+        OutputDebugStringA("[dxgi_win7] ERROR: system dxgi.dll not found!\n");
         return FALSE;
     }
-    *(FARPROC*)&g_pfnFactory  =GetProcAddress(g_hDxgiReal,"CreateDXGIFactory");
-    *(FARPROC*)&g_pfnFactory1 =GetProcAddress(g_hDxgiReal,"CreateDXGIFactory1");
-    *(FARPROC*)&g_pfnFactory2 =GetProcAddress(g_hDxgiReal,"CreateDXGIFactory2");
-    LOG("dxgi_real.dll chargé (F=%p F1=%p F2=%p)",(void*)g_pfnFactory,(void*)g_pfnFactory1,(void*)g_pfnFactory2);
-    return g_pfnFactory!=NULL;
+    *(FARPROC*)&g_pfnFactory  = GetProcAddress(g_hDxgiSystem, "CreateDXGIFactory");
+    *(FARPROC*)&g_pfnFactory1 = GetProcAddress(g_hDxgiSystem, "CreateDXGIFactory1");
+    *(FARPROC*)&g_pfnFactory2 = GetProcAddress(g_hDxgiSystem, "CreateDXGIFactory2");
+    LOG("system dxgi.dll loaded (F=%p F1=%p F2=%p)", (void*)g_pfnFactory, (void*)g_pfnFactory1, (void*)g_pfnFactory2);
+    return g_pfnFactory != NULL;
 }
 
 static void Init_D3DKMT(void)
@@ -2849,12 +2705,6 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved)
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hInst);
         LOG("DllMain DLL_PROCESS_ATTACH");
-        /*
-         * Marqueur de build : permet de vérifier immédiatement dans les logs
-         * qu'on a bien chargé le binaire fraîchement recompilé, et pas un
-         * ancien dxgi.dll resté en place (cause de logs "identiques" entre
-         * deux sessions de debug malgré des correctifs appliqués au source).
-         */
         LOG("Build: " __DATE__ " " __TIME__ " | fence_off GetCompletedValue=0x%X SetEventOnCompletion=0x%X Signal(CQ)=0x%X CreateFence(Dev)=0x%X",
             D3D12FENCE_GetCompletedValue_OFF, D3D12FENCE_SetEventOnCompletion_OFF,
             D3D12CQ_Signal_OFF, D3D12DEV_CreateFence_OFF);
@@ -2863,14 +2713,14 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved)
         Init_Ntdll();
         Init_D3DKMT();
         Init_ExePath();
-        if(!Init_RealDxgi())
-            OutputDebugStringA("[dxgi_win7] Warning: mode dégradé sans dxgi_real.dll\n");
+        if(!Init_SystemDxgi())
+            OutputDebugStringA("[dxgi_win7] Warning: system dxgi.dll not loaded (will fallback to built-in stubs)\n");
         LOG("DllMain OK");
         break;
 
     case DLL_PROCESS_DETACH:
         LOG("DllMain DLL_PROCESS_DETACH");
-        if(g_hDxgiReal){FreeLibrary(g_hDxgiReal);g_hDxgiReal=NULL;}
+        if(g_hDxgiSystem){FreeLibrary(g_hDxgiSystem);g_hDxgiSystem=NULL;}
         if(g_pExePath){HeapFree(GetProcessHeap(),0,g_pExePath);g_pExePath=NULL;}
         if(g_pExeDir) {HeapFree(GetProcessHeap(),0,g_pExeDir); g_pExeDir=NULL;}
         DeleteCriticalSection(&g_csCompat);
