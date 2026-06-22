@@ -17,4 +17,8 @@ b1.02
   -Translated the notes and log from French to English
 
 b1.04
-  Added partial support of CreateDXGIFactory2. Some Win32 samples using CreateDXGIFactory2 are now supported
+  -Added partial support of CreateDXGIFactory2. Some Win32 samples using CreateDXGIFactory2 are now supported
+
+b1.07
+  -Increased compatibility with other samples
+  -Fixed some other errors with a microsoft sample even if it doesn't make this sample work. Basically Microsoft samples are very complex for no reason and are a pain to fix
