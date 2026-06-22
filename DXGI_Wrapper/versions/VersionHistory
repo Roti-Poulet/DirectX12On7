@@ -8,3 +8,6 @@ a1.12
 
 a1.18
   -Fixed C5 error in d3d11. Now rendering works with some D3D12 samples. For some of them, the image isn't being drawn into the created window, but the program does actually run
+
+b1.0
+  -Remade how the SwapChain works, and this is the first version where I got something rendering correctly with DirectX12 on Windows 7!
