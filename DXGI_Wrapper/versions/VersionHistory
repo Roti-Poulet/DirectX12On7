@@ -11,3 +11,6 @@ a1.18
 
 b1.0
   -Remade how the SwapChain works, and this is the first version where I got something rendering correctly with DirectX12 on Windows 7!
+
+b1.02
+  -Increased the wrapper compatibility. The AMD DirectX12 (https://github.com/GPUOpen-LibrariesAndSDKs/HelloD3D12) demo now works!
