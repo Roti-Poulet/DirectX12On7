@@ -25,3 +25,7 @@ b1.07
 
 b1.08
   -Fixed resizing a window make it crash
+
+b1.13
+  -Increased app compatibility. For example I got UnrealEngine 4 SunTemple benchmark running with D3D12 mode on Windows 7
+  -Optimized a tiny bit the wrapper by removing useless logs
