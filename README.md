@@ -18,14 +18,15 @@ This does not need any D3D12On7 support inside the application itself, it *imple
 3) Open your x64 Native Tools Developer Command Prompt, change the directory to where you extracted the ZIP /DXGI_Wrapper/Versions/(The latest version)
 4) Execute this command to build the binary: cl /LD /O2 /std:c11 /MT dxgi_win7.c /Fe:dxgw.dll dxgi_win7.def dxgi.lib d2d1.lib oleaut32.lib gdi32.lib advapi32.lib user32.lib
 
-## Can I make my own fork and modify some files of this project ?***
+## Can I make my own fork and modify some files of this project ?
 
 Yes, but please give credits. If you want to help me adding new features and increasing the support, you can add me on Discord: roti_poulet
 
-## Tested games that does work:
+## Tested programs/games that does work:
 - SunTemple Unreal Engine 4 (D3D12 mode)
 - Resident Evil Village/8 [Moving the window makes the game crash, but I got ingame and everything seems to work perfectly fine after replacing MFCreateDXGIFactory to MFStartup]
+- DirectX12 Win32 sample by clandrew (using CreateDXGIFactory2)
 
-Feel free to make a new issue  if your game doesn't work :)
+Feel free to make a new issue if your game doesn't work :)
 
 Made with love from France :D
