@@ -9,9 +9,9 @@ EXPORTS
     PIXEndCapture                   @6
     PIXGetCaptureState              @7
     SetAppCompatStringPointer       @8
-    CreateDXGIFactory               @9
-    CreateDXGIFactory1              @10
-    CreateDXGIFactory2              @11
+    CreateDXGIFactory    = FakeCreateDXGIFactory    @9
+    CreateDXGIFactory1   = FakeCreateDXGIFactory1   @10
+    CreateDXGIFactory2   = FakeCreateDXGIFactory2   @11
     DXGID3D10CreateDevice           @12
     DXGID3D10CreateLayeredDevice    @13
     DXGID3D10GetLayeredDeviceSize   @14

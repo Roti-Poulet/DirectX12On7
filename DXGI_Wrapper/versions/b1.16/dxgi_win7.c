@@ -8,6 +8,14 @@
  * Single source + dxgi_win7.def
  */
 
+/* __thread doesn't work on MSVC */
+
+#if defined(_MSC_VER)
+    #define THREAD_LOCAL __declspec(thread)
+#else
+    #define THREAD_LOCAL __thread
+#endif
+
 /* =========================================================
  * Includes / base types
  * ========================================================= */
@@ -237,10 +245,10 @@ static volatile LONG g_logVerbose = 1;
  * ========================================================= */
 #include <setjmp.h>
 
-/* __thread (GCC native extension) instead of __declspec(thread) */
-static __thread jmp_buf  g_SehJmpBuf;
-static __thread BOOL     g_SehArmed = FALSE;
-static __thread DWORD    g_SehLastExceptionCode = 0;
+/* Make it compatible with both MSVC and GCC, see top of file */
+THREAD_LOCAL jmp_buf g_SehJmpBuf;
+THREAD_LOCAL BOOL g_SehArmed = FALSE;
+THREAD_LOCAL DWORD g_SehLastExceptionCode = 0;
 static PVOID g_SehVehHandle = NULL;
 
 static LONG CALLBACK SehVectoredHandler(EXCEPTION_POINTERS *pInfo)
@@ -515,6 +523,7 @@ typedef struct _D3D12_CLEAR_VALUE_MIN {
 #define D3D12FENCE_Signal_OFF                0x50
 
 
+
 /* =========================================================
  * Diagnostic helper: validates a function pointer before calling
  * ========================================================= */
@@ -604,13 +613,6 @@ static const char* GuidNameRaw(REFIID riid)
 #define LOG_GUID(label,riid) LOG("%s riid=%s",(label),GuidNameRaw(riid))
 
 /* =========================================================
- * Function pointer types — system dxgi.dll
- * ========================================================= */
-typedef HRESULT (WINAPI *PFN_CreateDXGIFactory )(REFIID, void**);
-typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1)(REFIID, void**);
-typedef HRESULT (WINAPI *PFN_CreateDXGIFactory2)(UINT,   REFIID, void**);
-
-/* =========================================================
  * D3DKMT function pointers (gdi32.dll)
  * ========================================================= */
 typedef UINT D3DKMT_HANDLE;
@@ -622,6 +624,10 @@ typedef NTSTATUS (APIENTRY *PFN_D3DKMTSetProcessDeviceRemovalSupport)(const D3DK
 typedef NTSTATUS (APIENTRY *PFN_D3DKMTCheckVidPnExclusiveOwnership)(const D3DKMT_CHECKVIDPNEXCLUSIVEOWNERSHIP*);
 typedef NTSTATUS (APIENTRY *PFN_D3DKMTWaitForVerticalBlankEvent)(const D3DKMT_WAITFORVERTICALBLANKEVENT*);
 typedef NTSTATUS (APIENTRY *PFN_D3DKMTWaitForVerticalBlankEvent2)(const D3DKMT_WAITFORVERTICALBLANKEVENT2*);
+
+typedef HRESULT (WINAPI *PFN_CreateDXGIFactory )(REFIID riid, void **ppFactory);
+typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1)(REFIID riid, void **ppFactory);
+typedef HRESULT (WINAPI *PFN_CreateDXGIFactory2)(UINT flags, REFIID riid, void **ppFactory);
 
 /* WNF (Windows Notification Facility) */
 typedef ULONG64 WNF_STATE_NAME;
@@ -640,6 +646,7 @@ static HMODULE               g_hDxgiSystem   = NULL;
 static PFN_CreateDXGIFactory  g_pfnFactory    = NULL;
 static PFN_CreateDXGIFactory1 g_pfnFactory1   = NULL;
 static PFN_CreateDXGIFactory2 g_pfnFactory2   = NULL;
+
 /* Reentrancy guards for CreateDXGIFactory* — set to 1 while we are inside
  * the wrapper so that recursive calls (PIX/DXCapture/UE4) bypass wrapping
  * and go straight to the system dxgi.dll.  Plain globals (not TLS) are
@@ -2928,8 +2935,10 @@ static FARPROC PIX_Intercept(FARPROC pfnDefault, LPCSTR pGetPP, LPCSTR pGen)
  * =================== PUBLIC EXPORTS ====================
  * ========================================================= */
 
+/* Renamed CreateDXGIFactory functions, MSVC does not like it when you use the real API name, see .def */
+
 __declspec(dllexport)
-HRESULT WINAPI CreateDXGIFactory(REFIID riid, void **ppFactory)
+HRESULT WINAPI FakeCreateDXGIFactory(REFIID riid, void **ppFactory)
 {
     HRESULT hr;
     /* Reentrancy guard: PIX/RenderDoc hooks or UE4's DXCapture integration
@@ -2981,7 +2990,7 @@ HRESULT WINAPI CreateDXGIFactory(REFIID riid, void **ppFactory)
 }
 
 __declspec(dllexport)
-HRESULT WINAPI CreateDXGIFactory1(REFIID riid, void **ppFactory)
+HRESULT WINAPI FakeCreateDXGIFactory1(REFIID riid, void **ppFactory)
 {
     HRESULT hr;
     if (InterlockedCompareExchange(&g_inCreateFactory1, 1, 0) != 0) {
@@ -3030,7 +3039,7 @@ HRESULT WINAPI CreateDXGIFactory1(REFIID riid, void **ppFactory)
 }
 
 __declspec(dllexport)
-HRESULT WINAPI CreateDXGIFactory2(UINT Flags, REFIID riid, void **ppFactory)
+HRESULT WINAPI FakeCreateDXGIFactory2(UINT Flags, REFIID riid, void **ppFactory)
 {
     if (InterlockedCompareExchange(&g_inCreateFactory2, 1, 0) != 0) {
         LOG("CreateDXGIFactory2: reentrant call detected, bypassing wrapper");
