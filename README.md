@@ -13,10 +13,10 @@ This does not need any D3D12On7 support inside the application itself, it *imple
 
 ***Can I make my own fork and modify some files of this project ?***
 
-Yes, but please give credits. If you want to help me adding new features and increasing the support, you can add me on Discord: roti_poulet-
+Yes, but please give credits. If you want to help me adding new features and increasing the support, you can add me on Discord: roti_poulet
 
 ***Tested games that does work:***
 - SunTemple Unreal Engine 4 (D3D12 mode)
-- Resident Evil Village/8 [Moving the window makes the game crash, but I got ingame and everything seems to work perfectly fine]
+- Resident Evil Village/8 [Moving the window makes the game crash, but I got ingame and everything seems to work perfectly fine after replacing MFCreateDXGIFactory to MFStartup]
 
 Made with love from France :D
