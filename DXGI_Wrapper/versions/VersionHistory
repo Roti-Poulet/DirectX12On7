@@ -29,3 +29,7 @@ b1.08
 b1.13
   -Increased app compatibility. For example I got UnrealEngine 4 SunTemple benchmark running with D3D12 mode on Windows 7
   -Optimized a tiny bit the wrapper by removing useless logs
+
+b1.16
+  -Added config file (FPS Display [only for testings] and OutputLogFile [useful if you don't have x64dbg installed])
+  -Optimized a tiny more the wrapper by caching values instead of re-calculating them
