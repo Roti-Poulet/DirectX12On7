@@ -32,4 +32,8 @@ Yes, but please give credits. If you want to help me adding new features and inc
 
 Feel free to make a new issue if your game doesn't work :)
 
+## Limitations
+For now, DirectX12On7 is only a DXGI wrapper, which doesn't allow new graphical effects and better optimization. Its why some games are just not fixable and others will run very poorly
+
+
 Made with love from France :D
