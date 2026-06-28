@@ -9,7 +9,8 @@ This does not need any D3D12On7 support inside the application itself, it *imple
 1) Download the source code ZIP ( https://github.com/Roti-Poulet/DirectX12On7/archive/refs/heads/main.zip )
 2) Extract it
 
-***If you are building with MinGW64 (GCC)***
+***If you are building with MinGW64 (GCC)*** **(what I use to make the binaries)**
+
 3) Open MinGW64, change the directory to where you extracted the ZIP /DXGI_Wrapper/Versions/(The latest version)
 4) Execute this command to build the binary: x86_64-w64-mingw32-gcc -m64 -shared -O2 -std=c11 -o dxgw.dll dxgi_win7.c dxgi_win7.def -ldxgi -ld2d1 -loleaut32 -lgdi32 -static
 
@@ -26,6 +27,8 @@ Yes, but please give credits. If you want to help me adding new features and inc
 - SunTemple Unreal Engine 4 (D3D12 mode)
 - Resident Evil Village/8 [Moving the window makes the game crash, but I got ingame and everything seems to work perfectly fine after replacing MFCreateDXGIFactory to MFStartup]
 - DirectX12 Win32 sample by clandrew (using CreateDXGIFactory2)
+- Cyberpunk v1.6. Support is kind of experimental but the game does work
+
 
 Feel free to make a new issue if your game doesn't work :)
 
