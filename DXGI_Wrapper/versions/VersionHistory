@@ -34,3 +34,6 @@ b1.16
   -Added config file (FPS Display [only for testings] and OutputLogFile [useful if you don't have x64dbg installed])
   -Optimized a tiny more the wrapper by caching values instead of re-calculating them
   -Added MSVC support thanks to OwnedByWuggy
+
+b1.23
+  -Reduced Cyberpunk (v1.6) crashing by quite a lot. It might still crash on launch, just retry a second time. Once ingame, Cyberpunk doesn't crash anymore
