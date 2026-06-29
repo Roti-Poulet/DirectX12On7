@@ -4,7 +4,7 @@
  * Provides D3D12on7 support via ID3D12CommandQueueDownlevel, allowing
  * DirectX 12 applications to run on Windows 7.
  *
- * Compiled with MinGW64: x86_64-w64-mingw32-gcc -m64 -shared -O2 -std=c11 -o dxgw.dll dxgi_win791.c dxgi_win7.def -ldxgi -ld2d1 -loleaut32 -static -lgdi32
+ * Compiled with MinGW64: x86_64-w64-mingw32-gcc -m64 -shared -O2 -std=c11 -o dxgw.dll dxgi_win7.c dxgi_win7.def -ldxgi -ld2d1 -loleaut32 -static -lgdi32
  * Single source + dxgi_win7.def
  */
 
