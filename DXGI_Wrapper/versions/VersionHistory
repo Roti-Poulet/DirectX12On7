@@ -36,4 +36,7 @@ b1.16
   -Added MSVC support thanks to OwnedByWuggy
 
 b1.23
-  -Reduced Cyberpunk (v1.6) crashing by quite a lot. It might still crash on launch, just retry a second time. Once ingame, Cyberpunk doesn't crash anymore
+  -Reduced Cyberpunk (v1.6) crashing by quite a lot with lower settings. It might still crash on launch, just retry a second time.
+
+b1.23.1
+  -Added file description
