@@ -45,3 +45,4 @@ b1.27
   -Remade the FPS counter, there are the changes:
     -Better optimization
     -Fixed overlay flickering
+    -Added FPSOverlayRefreshCooldown
