@@ -50,3 +50,6 @@ b1.27
 b1.29
   -Renamed the wrapper from dxgw to dxgi for ease to use
   -Fixed multithreading bug in CreateDXGIFactory(x)
+
+b1.30
+  -Fixed a bug that caused the NO_INTERFACE bug. This fixes Control with DirectX12
