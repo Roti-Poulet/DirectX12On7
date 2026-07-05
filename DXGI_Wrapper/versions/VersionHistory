@@ -46,3 +46,7 @@ b1.27
     -Better optimization
     -Fixed overlay flickering
     -Added FPSOverlayRefreshCooldown
+
+b1.29
+  -Renamed the wrapper from dxgw to dxgi for ease to use
+  -Fixed multithreading bug in CreateDXGIFactory(x)
