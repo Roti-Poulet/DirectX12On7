@@ -40,3 +40,8 @@ b1.23
 
 b1.23.1
   -Added file description
+
+b1.27
+  -Remade the FPS counter, there are the changes:
+    -Better optimization
+    -Fixed overlay flickering
