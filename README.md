@@ -27,8 +27,8 @@ Yes, but please give credits. If you want to help me adding new features and inc
 - SunTemple Unreal Engine 4 (D3D12 mode)
 - Resident Evil Village/8 [Moving the window makes the game crash, but I got ingame and everything seems to work perfectly fine after replacing MFCreateDXGIFactory to MFStartup]
 - DirectX12 Win32 sample by clandrew (using CreateDXGIFactory2)
-- Cyberpunk v1.6. Support is kind of experimental but the game does work
-
+- Red Dead Redemption
+- Control (in DX12 mode), support is experimental but it does work
 
 Feel free to make a new issue if your game doesn't work :)
 
