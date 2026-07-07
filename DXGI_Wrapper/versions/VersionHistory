@@ -53,3 +53,6 @@ b1.29
 
 b1.30
   -Fixed a bug that caused the NO_INTERFACE bug. This fixes Control with DirectX12
+
+b1.32
+  -Added an option to spoof the VRAM amount
