@@ -56,3 +56,11 @@ b1.30
 
 b1.32
   -Added an option to spoof the VRAM amount
+
+b1.34
+  -Fixed VSync not working with an option in the INI config file (set VSync mode to 1)
+  -Fixed minimizing the program make it crash
+  -Fixed VRAM detection and disabled the VRAM spoof by default (default value is 0)
+
+b1.35
+  -Fixed a bug where the program would crash if it called GetParent(IDXGIFactory) after the SwapChain creation. This fixes Grid 2019 (in DX12 mode)
