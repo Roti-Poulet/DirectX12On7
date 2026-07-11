@@ -12,12 +12,12 @@ This does not need any D3D12On7 support inside the application itself, it *imple
 ***If you are building with MinGW64 (GCC)*** **(what I use to make the binaries)**
 
 3) Open MinGW64, change the directory to where you extracted the ZIP /DXGI_Wrapper/Versions/(The latest version)
-4) Execute this command to build the binary: x86_64-w64-mingw32-gcc -m64 -shared -O2 -std=c11 -o dxgw.dll dxgi_win7.c dxgi_win7.def -ldxgi -ld2d1 -loleaut32 -lgdi32 -static
+4) Execute this command to build the binary: x86_64-w64-mingw32-gcc -m64 -shared -O2 -std=c11 -o dxgi.dll dxgi_win7.c dxgi_win7.def -ldxgi -ld2d1 -loleaut32 -lgdi32
 
 ***If you are building with MSVC (MSVC 2019 tested only)***
 
 3) Open your x64 Native Tools Developer Command Prompt, change the directory to where you extracted the ZIP /DXGI_Wrapper/Versions/(The latest version)
-4) Execute this command to build the binary: cl /LD /O2 /std:c11 /MT dxgi_win7.c /Fe:dxgw.dll dxgi_win7.def dxgi.lib d2d1.lib oleaut32.lib gdi32.lib advapi32.lib user32.lib
+4) Execute this command to build the binary: cl /LD /O2 /std:c11 /MT dxgi_win7.c /Fe:dxgi.dll dxgi_win7.def dxgi.lib d2d1.lib oleaut32.lib gdi32.lib advapi32.lib user32.lib
 
 ## Can I make my own fork and modify some files of this project ?
 
@@ -25,15 +25,21 @@ Yes, but please give credits. If you want to help me adding new features and inc
 
 ## Tested programs/games that does work:
 - SunTemple Unreal Engine 4 (D3D12 mode)
-- Resident Evil Village/8 [Moving the window makes the game crash, but I got ingame and everything seems to work perfectly fine after replacing MFCreateDXGIFactory to MFStartup]
+- Resident Evil Village/8
 - DirectX12 Win32 sample by clandrew (using CreateDXGIFactory2)
 - Red Dead Redemption
-- Control (in DX12 mode), support is experimental but it does work
+- Control (in DX12 mode), support is experimental but it works
+- Grid 2019 (in DX12 mode), support is experimental but it works
 
 Feel free to make a new issue if your game doesn't work :)
 
-## Limitations
-For now, DirectX12On7 is only a DXGI wrapper, which doesn't allow new graphical effects and better optimization. Its why some games are just not fixable and others will run very poorly. I might remake the entire D3D12 runtime for Windows 7 if I can, but compatibility might be worse
+## Can I use this project and VxKex at the same time?
+With beta builds of VxKex (made by vxiiduu), you can use DirectX12On7 and VxKex at the same time, with a registry tweak. VxKex 1.1.x isn't supported (both i486 and VxKex-NEXT forks). To download these beta builds, add me on Discord: roti_poulet . It's not my work so I can't post it here because of the stupid github security.
+Reg tweak: Enable VxKex on the program EXE, click on "Open in Registry editor" (IEFO path), and set dxgi:|d3d12 as the KEX_DllRewriteEntries string value.
 
+ViKex (VxKex fork for Windows Vista) will not work because Vista doesn't support Image Execution File Options (IEFO).
+
+## Limitations
+For now, DirectX12On7 is only a DXGI wrapper, which doesn't allow new graphical effects and better optimization: for example UE5 and late UE4 games won't work. Its why some games are just not fixable and others will run very poorly, with low CPU/GPU/RAM usage (Control and Grid 2019 for example). Support hasn't been tested with AMD GPUs but it should work.
 
 Made with love from France :D
