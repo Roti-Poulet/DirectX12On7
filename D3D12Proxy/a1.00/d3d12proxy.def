@@ -1,0 +1,40 @@
+; ============================================================================
+; d3d12proxy.def
+;
+; Module definition file for the d3d12 proxy DLL.
+; This explicitly exports the standard d3d12.dll entry points under their
+; exact (case-sensitive) names, so the application sees the same export
+; table it would expect from the real DLL.
+;
+; CRITICAL: ordinals must match the real d3d12.dll's, not just the names.
+; Some callers (D3D12Core / redistributable bootstrapping code, some system
+; DLLs) import d3d12.dll's exports BY ORDINAL rather than by name. If our
+; proxy exports the same names but under different (linker-assigned)
+; ordinals, that ordinal-based import resolution fails at load time with
+; STATUS_ORDINAL_NOT_FOUND / ERROR_PROC_NOT_FOUND, even though the names
+; themselves all resolve fine via GetProcAddress-by-name. This is exactly
+; what happened here: x64dbg reported STATUS_ORDINAL_NOT_FOUND on our
+; d3d12.dll for ordinals 101/102.
+;
+; Ordinals below match the standard 64-bit d3d12.dll layout (confirmed via
+; dumpbin /exports on a real system d3d12.dll -- stable across the versions
+; that expose these particular exports; GetBehaviorValue/SetAppCompatString
+; Pointer/D3D12PIX*/D3D12DeviceRemovedExtendedData are intentionally NOT
+; exported here since nothing in this proxy chain calls them by ordinal or
+; by name, and D3D12On7 redistributables typically don't ship them anyway).
+;
+; The LIBRARY name below is purely informational for some linkers; the
+; actual output file name is still chosen with the "-o" flag at link time
+; (it should be "d3d12.dll" for deployment).
+; ============================================================================
+
+LIBRARY d3d12
+
+EXPORTS
+    D3D12CreateDevice                              @101
+    D3D12GetDebugInterface                         @102
+    D3D12CreateRootSignatureDeserializer           @107
+    D3D12CreateVersionedRootSignatureDeserializer  @108
+    D3D12SerializeRootSignature                    @115
+    D3D12SerializeVersionedRootSignature            @116
+    D3D12EnableExperimentalFeatures                @110

@@ -1,0 +1,2 @@
+This is an experimental D3D12 proxy meant to run with D3D12On7
+Right now, for tests only
