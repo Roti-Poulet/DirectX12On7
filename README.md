@@ -34,8 +34,8 @@ Yes, but please give credits. If you want to help me adding new features and inc
 Feel free to make a new issue if your game doesn't work :)
 
 ## Can I use this project and VxKex at the same time?
-With beta builds of VxKex (made by vxiiduu), you can use DirectX12On7 and VxKex at the same time, with a registry tweak. VxKex 1.1.x isn't supported (both i486 and VxKex-NEXT forks). To download these beta builds, add me on Discord: roti_poulet . It's not my work so I can't post it here because of the stupid github security.
-Reg tweak: Enable VxKex on the program EXE, click on "Open in Registry editor" (IEFO path), and set dxgi:|d3d12 as the KEX_DllRewriteEntries string value.
+Yes, but only 1.2.x is supported (by i486/vxiiduu), and a reg tweak is needed:
+Enable VxKex on the program EXE, click on "Open in Registry editor" (IEFO path), and set dxgi:|d3d12 as the KEX_DllRewriteEntries string value.
 
 ViKex (VxKex fork for Windows Vista) will not work because Vista doesn't support Image Execution File Options (IEFO).
 
