@@ -5,6 +5,8 @@ A patch to get DirectX12 running on Windows 7, using Microsoft DLLs (d3d12.dll a
 
 This does not need any D3D12On7 support inside the application itself, it *implements* D3D12On7 **outside** the game.
 
+Showcase video: https://www.youtube.com/watch?v=H8ISZQ7ZA24
+
 ## How to build myself ?
 1) Download the source code ZIP ( https://github.com/Roti-Poulet/DirectX12On7/archive/refs/heads/main.zip )
 2) Extract it
