@@ -36,4 +36,31 @@ b1.16
   -Added MSVC support thanks to OwnedByWuggy
 
 b1.23
-  -Reduced Cyberpunk (v1.6) crashing by quite a lot. It might still crash on launch, just retry a second time. Once ingame, Cyberpunk doesn't crash anymore
+  -Reduced Cyberpunk (v1.6) crashing by quite a lot with lower settings. It might still crash on launch, just retry a second time.
+
+b1.23.1
+  -Added file description
+
+b1.27
+  -Remade the FPS counter, there are the changes:
+    -Better optimization
+    -Fixed overlay flickering
+    -Added FPSOverlayRefreshCooldown
+
+b1.29
+  -Renamed the wrapper from dxgw to dxgi for ease to use
+  -Fixed multithreading bug in CreateDXGIFactory(x)
+
+b1.30
+  -Fixed a bug that caused the NO_INTERFACE bug. This fixes Control with DirectX12
+
+b1.32
+  -Added an option to spoof the VRAM amount
+
+b1.34
+  -Fixed VSync not working with an option in the INI config file (set VSync mode to 1)
+  -Fixed minimizing the program make it crash
+  -Fixed VRAM detection and disabled the VRAM spoof by default (default value is 0)
+
+b1.35
+  -Fixed a bug where the program would crash if it called GetParent(IDXGIFactory) after the SwapChain creation. This fixes Grid 2019 (in DX12 mode)
