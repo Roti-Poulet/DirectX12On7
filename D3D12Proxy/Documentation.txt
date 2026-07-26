@@ -1,2 +1,5 @@
 This is an experimental D3D12 proxy meant to run with D3D12On7
 Right now, for tests only
+
+b1.12
+   -Added lots of debugging features and Shader Model (SM) 6.6 spoof (even if SM 6.6 doesn't really work, only SM 6.4 is officially supported by the d3d12on7 runtime)
