@@ -32,6 +32,7 @@ Yes, but please give credits. If you want to help me adding new features and inc
 - Red Dead Redemption
 - Control (in DX12 mode), support is experimental but it works
 - Grid 2019 (in DX12 mode), support is experimental but it works
+- Xenia-Canary
 
 Feel free to make a new issue if your game doesn't work :)
 
