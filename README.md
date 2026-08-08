@@ -34,6 +34,8 @@ Yes, but please give credits. If you want to help me adding new features and inc
 - Grid 2019 (in DX12 mode), support is experimental but it works
 - Xenia-Canary
 
+Most games that work (except the rendering part) on Windows 7 should now fully work, it is not limited to these games only!
+
 Feel free to make a new issue if your game doesn't work :)
 
 ## Can I use this project and VxKex at the same time?
@@ -43,6 +45,6 @@ Enable VxKex on the program EXE, click on "Open in Registry editor" (IEFO path),
 ViKex (VxKex fork for Windows Vista) will not work because Vista doesn't support Image Execution File Options (IEFO).
 
 ## Limitations
-For now, DirectX12On7 is only a DXGI wrapper, which doesn't allow new graphical effects and better optimization: for example UE5 and late UE4 games won't work. Its why some games are just not fixable and others will run very poorly, with low CPU/GPU/RAM usage (Control and Grid 2019 for example). Support hasn't been tested with AMD GPUs but it should work.
+For now, DirectX12On7 is only a DXGI wrapper, which doesn't allow new graphical effects and better optimization: for example UE5 and late UE4 games won't work. Its why some games are just not fixable and others will run very poorly, with low CPU/GPU/RAM usage (Control and Grid 2019 for example). AMD drivers are known to work better with DirectX12On7.
 
 Made with love from France :D
