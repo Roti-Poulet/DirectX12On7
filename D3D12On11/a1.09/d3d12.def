@@ -1,0 +1,30 @@
+; ============================================================================
+; d3d12.def - Exports complets pour Windows 7 (fusion des deux versions)
+; ============================================================================
+
+LIBRARY d3d12
+
+EXPORTS
+    ; Exports par nom (essentiels)
+    D3D12CreateDevice
+    D3D12CreateDeviceAndSwapChain
+    D3D12GetDebugInterface
+    D3D12GetInterface
+    D3D12SerializeRootSignature
+    D3D12SerializeVersionedRootSignature
+    D3D12CreateRootSignatureDeserializer
+    D3D12CreateVersionedRootSignatureDeserializer
+    D3D12EnableExperimentalFeatures
+    D3D12DeviceRemovedExtendedData
+
+    ; Exports par ordinal (compatibilité Wine / certains jeux)
+    D3D12CoreCreateLayeredDevice    @100
+    D3D12CoreGetLayeredDeviceSize   @101
+    D3D12CoreRegisterLayers         @102
+    OpenAdapter10_2                 @103
+
+    ; Autres exports PIX / debug (souvent appelés)
+    D3D12PIXEventsReplaceBlock
+    D3D12PIXGetThreadInfo
+    D3D12PIXNotifyWakeFromFenceSignal
+    D3D12PIXReportCounter
