@@ -40,7 +40,7 @@ Feel free to make a new issue if your game doesn't work :)
 
 ## Can I use this project and VxKex at the same time?
 Yes, but only 1.2.x is supported (by i486/vxiiduu), and a reg tweak is needed:
-Enable VxKex on the program EXE, click on "Open in Registry editor" (IEFO path), and set dxgi:|d3d12 as the KEX_DllRewriteEntries string value.
+Enable VxKex on the program EXE, click on "Open in Registry editor" (IEFO path), and set __dxgi:|d3d12__ as the KEX_DllRewriteEntries string value.
 
 ViKex (VxKex fork for Windows Vista) will not work because Vista doesn't support Image Execution File Options (IEFO).
 
