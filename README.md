@@ -1,6 +1,8 @@
 # DirectX12On7
 A patch to get DirectX12 running on Windows 7, using Microsoft DLLs (d3d12.dll and dxilconv7.dll) and some coding for the DirectX Graphics Interface (DXGI) wrapper.
 
+# This is now discontinued, replaced by the WDDM2On7 port (https://w7revived.chefkiss.dev/WDDM2Win7/)
+
 **This is a real implementation of DirectX12, not just an emulation using Vulkan** (VKD3D), so it's a bit more optimized.
 
 This does not need any D3D12On7 support inside the application itself, it *implements* D3D12On7 **outside** the game.
